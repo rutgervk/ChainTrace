@@ -81,14 +81,32 @@ let abortCtl = new AbortController();
 function acquire() { return new Promise(r => { if (running < MAX_PAR) { running++; r(); } else waiting.push(r); }); }
 function release() { const next = waiting.shift(); if (next) next(); else running--; }
 
+// Minimale tijd tussen verzoeken per host; TronGrid zonder API-sleutel is streng.
+const HOST_GAP = { 'api.trongrid.io': 1050 }; // gemeten: ~1 verzoek/s wordt geaccepteerd
+const hostNext = {};
+async function throttle(host) {
+  const gap = HOST_GAP[host];
+  if (!gap) return;
+  const now = Date.now();
+  const at = Math.max(now, hostNext[host] || 0);
+  hostNext[host] = at + gap;
+  if (at > now) await sleep(at - now);
+}
+
 function getData(url, asText = false) {
   if (cache.has(url)) return cache.get(url);
+  const host = new URL(url).host;
   const p = (async () => {
     await acquire();
     try {
-      for (let attempt = 0; attempt < 4; attempt++) {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        await throttle(host);
         const r = await fetch(url, { signal: abortCtl.signal });
-        if (r.status === 429 || r.status >= 500) { await sleep(700 * 2 ** attempt); continue; }
+        if (r.status === 429 || r.status >= 500) {
+          const ra = Number(r.headers.get('retry-after'));
+          await sleep(ra > 0 ? Math.min(ra * 1000, 20000) : Math.min(1000 * 2 ** attempt, 15000));
+          continue;
+        }
         if (r.status === 404 || r.status === 400) return null;
         if (!r.ok) throw new Error(`HTTP ${r.status} van ${new URL(url).host}`);
         return asText ? r.text() : r.json();
@@ -230,10 +248,11 @@ async function fetchTron(addr) {
   return { transfers, meta: {}, txCount: null, balance: null };
 }
 
-function fetchAddr(chain, addr) {
-  if (chain === 'btc') return fetchBtc(addr);
-  if (isEvm(chain)) return fetchEvm(chain, addr);
-  return fetchTron(addr);
+async function fetchAddr(chain, addr) {
+  const d = chain === 'btc' ? await fetchBtc(addr) : isEvm(chain) ? await fetchEvm(chain, addr) : await fetchTron(addr);
+  // Absurde bedragen (bv. 2^256-"transfers" van nep-tokens) als spam behandelen.
+  for (const t of d.transfers) if (t.value > 1e12) { t.dust = true; t.usd = null; }
+  return d;
 }
 
 // ---------- grafiekmodel ----------
@@ -378,18 +397,14 @@ function addEdge(chain, from, to, t) {
   if (e.txs.length < 50) e.txs.push({ txid: t.txid, value: t.value, asset: t.asset, time: t.time });
 }
 
-async function expand(n, depth, dir) {
-  if (stopped || n.expanded) return [];
-  n.expanded = true;
-  n.depth = Math.min(n.depth || depth, depth);
-  setStatus(`Ophalen ${short(n.addr)} (hop ${depth})…`);
+// Haalt transacties van een adres op (eenmalig), voegt metadata samen en analyseert het adres.
+async function loadData(n) {
+  if (n.data) return n.data;
   try {
     n.data = await fetchAddr(n.chain, n.addr);
   } catch (err) {
-    if (err.name === 'AbortError') return [];
-    addFlag(n, 'error', 'info', 'Ophalen mislukt: ' + err.message);
-    scheduleRender();
-    return [];
+    if (err.name !== 'AbortError') addFlag(n, 'error', 'info', 'Ophalen mislukt: ' + err.message);
+    return null;
   }
   for (const [k, m] of Object.entries(n.data.meta)) {
     const key = n.chain + ':' + k;
@@ -398,6 +413,15 @@ async function expand(n, depth, dir) {
     Object.assign(cur, { ...m, tags: cur.tags });
   }
   fullAnalyze(n);
+  return n.data;
+}
+
+async function expand(n, depth, dir) {
+  if (stopped || n.expanded) return [];
+  n.expanded = true;
+  n.depth = Math.min(n.depth || depth, depth);
+  setStatus(`Ophalen ${short(n.addr)} (hop ${depth})…`);
+  if (!await loadData(n)) { scheduleRender(); return []; }
   if (depth > 0 && isEndpoint(n)) { scheduleRender(); return []; }
 
   const { opts, pattern } = current;
@@ -458,6 +482,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   resetGraph();
   current = { chain, role, pattern, opts, seedKey: keyOf(chain, addr), started: new Date().toISOString() };
   dbCache.clear();
+  loadNotes();
   setBusy(true);
   setStatus('OSINT-lijsten laden (OFAC, ScamSniffer)…');
   await loadLists(chain);
@@ -471,12 +496,160 @@ async function runTrace(addr, chain, role, pattern, opts) {
     const results = await Promise.all(level.map(x => expand(x.n, x.depth, x.dir)));
     level = results.flat().filter(x => !x.n.expanded);
   }
+  // Automatisch de herkomst van het geld zoeken: startwallets en exchange-instroom.
+  if (!stopped) await traceOrigins(seed, { depth: role === 'perp' ? Math.max(3, opts.depth) : 2, fanIn: Math.max(4, opts.fanout) });
   setBusy(false);
   render(true);
   renderPlaybook();
   if (!stopped) recordObservations();
   setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen.`);
 }
+
+// ---------- herkomst: startwallets en instroom via exchanges ----------
+// Vanaf een adres stroomopwaarts langs inkomend geld tot een exchange/dienst (instroompunt)
+// of een wallet zonder eerdere instroom (startwallet = mogelijk slachtoffer of geldbron).
+const origins = { rootKey: null, starts: new Map(), cashIn: [] };
+const CASHIN_TYPES = { exchange: 'Exchange', service: 'Exchange/dienst (hoog volume)', mixer: 'Mixer', bridge: 'Bridge', contract: 'Smart contract', sanction: 'Gesanctioneerd adres' };
+
+function cashInType(n) {
+  for (const code of Object.keys(CASHIN_TYPES)) if (n.flags.some(f => f.code === code)) return code;
+  return null;
+}
+
+async function traceOrigins(root, { depth = 3, fanIn = 5 } = {}) {
+  origins.rootKey = root.key;
+  origins.starts = new Map();
+  origins.cashIn = [];
+  const sent = new Map(); // key → transfers van dit adres richting het vorige adres in de keten
+  const seen = new Set([root.key]);
+  const limit = (current?.opts.maxNodes || 80) + 80;
+  let level = [{ n: root, hop: 0, child: null }];
+  while (level.length && !stopped) {
+    const results = await Promise.all(level.map(x => originStep(x, root, depth, fanIn, seen, sent, limit)));
+    level = results.flat();
+  }
+  scheduleRender();
+  renderOrigins();
+}
+
+function addStart(n, reason, sent) {
+  if (origins.starts.has(n.key)) return;
+  const txs = sent.get(n.key)?.txs || [];
+  const assets = {};
+  for (const t of txs) assets[t.asset] = (assets[t.asset] || 0) + t.value;
+  const times = txs.map(t => t.time).filter(Boolean);
+  origins.starts.set(n.key, {
+    key: n.key, addr: n.addr, chain: n.chain, reason, to: sent.get(n.key)?.to, assets,
+    usd: txs.reduce((s, t) => s + (t.usd || 0), 0), count: txs.length,
+    first: times.length ? Math.min(...times) : null, last: times.length ? Math.max(...times) : null
+  });
+  if (!n.role && !n.flags.some(f => f.level === 'high')) n.hint = 'victim2';
+  addFlag(n, 'startwallet', 'med', `Startwallet: ${reason} — mogelijk slachtoffer of geldbron`);
+}
+
+async function originStep({ n, hop, child }, root, depth, fanIn, seen, sent, limit) {
+  if (stopped) return [];
+  setStatus(`Herkomst zoeken: hop ${hop}, ${origins.starts.size} startwallets, ${origins.cashIn.length} instroom-tx…`);
+  // Op de maximale diepte niet meer ophalen: alleen labels bepalen of het een exchange is.
+  const atEdge = hop > 0 && hop >= depth;
+  const d = atEdge ? n.data : await loadData(n);
+  const type = hop > 0 ? cashInType(n) : null;
+  if (type) {
+    // Instroompunt gevonden: elke transactie van deze dienst naar de volgende wallet vastleggen.
+    const name = labelOf(n) || CASHIN_TYPES[type];
+    for (const t of sent.get(n.key)?.txs || []) {
+      origins.cashIn.push({ type, name, from: n.key, to: child.key, chain: n.chain, txid: t.txid, time: t.time, value: t.value, asset: t.asset, usd: t.usd });
+    }
+    if (child !== root) addStart(child, `gefinancierd vanuit ${name}`, sent);
+    return [];
+  }
+  if (hop === 0 && !d) return [];
+  if (atEdge) { addStart(n, 'maximale zoekdiepte bereikt', sent); return []; }
+  if (!d) { addStart(n, 'niet verder te volgen (ophalen mislukt)', sent); return []; }
+  const agg = new Map();
+  for (const t of d.transfers) {
+    if (t.to !== n.addr || t.from === n.addr || t.dust) continue;
+    // Alleen geld met waarde volgen: onbekende tokens zonder koers zijn meestal spam/airdrops.
+    if (n.chain !== 'btc' && t.usd == null) continue;
+    const a = agg.get(t.from) || { cp: t.from, rank: 0, list: [] };
+    a.rank += t.usd ?? (n.chain === 'btc' ? t.value : 0);
+    a.list.push(t);
+    agg.set(t.from, a);
+  }
+  const senders = [...agg.values()].sort((x, y) => (y.rank - x.rank) || (y.list.length - x.list.length)).slice(0, fanIn);
+  if (hop > 0 && !senders.length) { addStart(n, 'geen eerdere instroom gevonden', sent); return []; }
+  if (hop >= depth) { if (hop > 0) addStart(n, 'maximale zoekdiepte bereikt', sent); return []; }
+  const next = [];
+  for (const a of senders) {
+    if (nodes.size >= limit && !nodes.has(keyOf(n.chain, a.cp))) break;
+    const isNew = !nodes.has(keyOf(n.chain, a.cp));
+    const cn = getNode(n.chain, a.cp);
+    if (isNew) { cn.depth = hop + 1; cn.parent = n.key; cn.upstream = true; }
+    for (const t of a.list) addEdge(n.chain, t.from, t.to, t);
+    lightAnalyze(cn);
+    if (seen.has(cn.key)) continue;
+    seen.add(cn.key);
+    sent.set(cn.key, { to: n.key, txs: a.list });
+    next.push({ n: cn, hop: hop + 1, child: n });
+  }
+  scheduleRender();
+  return next;
+}
+
+function txUrl(chain, id) {
+  return { btc: `https://mempool.space/tx/${id}`, eth: `https://etherscan.io/tx/${id}`, op: `https://optimistic.etherscan.io/tx/${id}`, tron: `https://tronscan.org/#/transaction/${id}` }[chain];
+}
+
+const assetText = assets => Object.entries(assets).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([s, v]) => `${fmt(v)} ${s}`).join(' + ') || '—';
+
+function renderOrigins() {
+  const starts = [...origins.starts.values()].sort((a, b) => (b.usd - a.usd) || ((a.first || 0) - (b.first || 0)));
+  const cash = [...origins.cashIn].sort((a, b) => (a.time || 0) - (b.time || 0));
+  $('#origins').hidden = !origins.rootKey;
+  $('#startCount').textContent = starts.length;
+  $('#cashCount').textContent = cash.length;
+  $('#startList').innerHTML = starts.map((r, i) => {
+    const n = nodes.get(r.key);
+    return `<li data-k="${esc(r.key)}"><b>${esc((n && labelOf(n)) || short(r.addr))}</b> · ${esc(assetText(r.assets))}
+      <small>${esc(r.addr)}</small><small>${esc(r.reason)}${r.first ? ' · ' + fmtTime(r.first) : ''}</small></li>`;
+  }).join('') || '<li class="muted">Geen startwallets gevonden.</li>';
+  $('#cashList').innerHTML = cash.map(r => `<li data-k="${esc(r.to)}">
+      <b>${esc(r.name)}</b> → ${esc(short(nodes.get(r.to)?.addr || '?'))} · ${fmt(r.value)} ${esc(r.asset)}
+      <small>${fmtTime(r.time)}</small>
+      <small><a href="${esc(txUrl(r.chain, r.txid))}" target="_blank" rel="noopener noreferrer">${esc(r.txid)}</a></small></li>`).join('')
+    || '<li class="muted">Geen instroom via exchanges gevonden binnen de zoekdiepte.</li>';
+  for (const li of document.querySelectorAll('#startList li[data-k], #cashList li[data-k]')) {
+    li.addEventListener('click', ev => {
+      if (ev.target.tagName === 'A') return;
+      focusNode(li.dataset.k);
+      showNode(nodes.get(li.dataset.k));
+    });
+  }
+}
+
+function originsCsv() {
+  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = [['soort', 'naam/label', 'adres', 'naar adres', 'tx-hash', 'tijdstip (UTC)', 'bedrag', 'asset', 'reden'].map(q).join(',')];
+  const iso = t => t ? new Date(t * 1000).toISOString() : '';
+  for (const r of origins.cashIn) {
+    rows.push([CASHIN_TYPES[r.type], r.name, nodes.get(r.from)?.addr, nodes.get(r.to)?.addr, r.txid, iso(r.time), r.value, r.asset, ''].map(q).join(','));
+  }
+  for (const r of origins.starts.values()) {
+    const n = nodes.get(r.key);
+    rows.push(['Startwallet', n ? labelOf(n) : '', r.addr, nodes.get(r.to)?.addr, '', iso(r.first), Object.values(r.assets)[0] ?? '', Object.keys(r.assets)[0] ?? '', r.reason].map(q).join(','));
+  }
+  return rows.join('\r\n');
+}
+
+// ---------- notities ----------
+let notes = { case: '', nodes: {} };
+const notesKey = () => current ? 'chaintrace.notes.' + current.seedKey : null;
+function loadNotes() {
+  notes = (notesKey() && store.get(notesKey(), null)) || { case: '', nodes: {} };
+  $('#caseNote').value = notes.case || '';
+  $('#notesBox').hidden = !current;
+}
+function saveNotes() { if (notesKey()) store.set(notesKey(), notes); }
 
 // ---------- weergave ----------
 let cy = null;
@@ -501,27 +674,39 @@ function edgeLabel(e) {
   return parts.join(' + ') + (e.count > 1 ? ` (${e.count}×)` : '');
 }
 
+const THEMES = {
+  dark: { bg: '#0f1419', panel: '#171e26', text: '#e6edf3', muted: '#8b98a5', line: '#2b3742', edge: '#41505e', seedBorder: '#ffffff' },
+  light: { bg: '#ffffff', panel: '#f3f5f8', text: '#111827', muted: '#5b6673', line: '#d9dee5', edge: '#9aa5b1', seedBorder: '#111827' }
+};
+
+function cyStyle(themeName) {
+  const t = THEMES[themeName];
+  return [
+    { selector: 'node', style: {
+      'background-color': 'data(color)', label: 'data(label)', color: t.text, 'font-size': 10,
+      'text-valign': 'bottom', 'text-wrap': 'wrap', 'text-margin-y': 4, 'text-outline-color': t.bg, 'text-outline-width': 2,
+      width: 'data(size)', height: 'data(size)', 'border-width': 2, 'border-color': t.bg
+    } },
+    { selector: 'node[?seed]', style: { 'border-width': 4, 'border-color': t.seedBorder, 'font-weight': 'bold', 'font-size': 12 } },
+    { selector: 'node[?flagged]', style: { 'border-color': '#ff4d5e', 'border-style': 'double', 'border-width': 4 } },
+    { selector: 'node[?noted]', style: { 'background-image-opacity': 1, 'underlay-color': '#f5c518', 'underlay-opacity': 0.35, 'underlay-padding': 5, 'underlay-shape': 'ellipse' } },
+    { selector: 'node:selected', style: { 'overlay-color': '#4ea1ff', 'overlay-opacity': 0.25, 'overlay-padding': 6 } },
+    { selector: 'edge', style: {
+      width: 'data(w)', 'line-color': t.edge, 'target-arrow-color': t.edge, 'target-arrow-shape': 'triangle',
+      'curve-style': 'bezier', label: 'data(label)', 'font-size': 8, color: t.muted, 'text-rotation': 'autorotate',
+      'text-background-color': t.bg, 'text-background-opacity': 0.85, 'text-background-padding': 2
+    } },
+    { selector: 'edge.hot', style: { 'line-color': '#ff9f43', 'target-arrow-color': '#ff9f43' } },
+    { selector: 'edge.upstream', style: { 'line-style': 'dashed', 'line-color': '#3fa7ff', 'target-arrow-color': '#3fa7ff' } },
+    { selector: 'edge:selected', style: { 'line-color': '#4ea1ff', 'target-arrow-color': '#4ea1ff' } }
+  ];
+}
+
 function initCy() {
   cy = cytoscape({
     container: $('#cy'),
     minZoom: 0.1, maxZoom: 3,
-    style: [
-      { selector: 'node', style: {
-        'background-color': 'data(color)', label: 'data(label)', color: '#e6edf3', 'font-size': 10,
-        'text-valign': 'bottom', 'text-wrap': 'wrap', 'text-margin-y': 4, 'text-outline-color': '#0f1419', 'text-outline-width': 2,
-        width: 'data(size)', height: 'data(size)', 'border-width': 2, 'border-color': '#0f1419'
-      } },
-      { selector: 'node[?seed]', style: { 'border-width': 4, 'border-color': '#ffffff', 'font-weight': 'bold', 'font-size': 12 } },
-      { selector: 'node[?flagged]', style: { 'border-color': '#ff4d5e', 'border-style': 'double', 'border-width': 4 } },
-      { selector: 'node:selected', style: { 'overlay-color': '#4ea1ff', 'overlay-opacity': 0.25, 'overlay-padding': 6 } },
-      { selector: 'edge', style: {
-        width: 'data(w)', 'line-color': '#41505e', 'target-arrow-color': '#41505e', 'target-arrow-shape': 'triangle',
-        'curve-style': 'bezier', label: 'data(label)', 'font-size': 8, color: '#8b98a5', 'text-rotation': 'autorotate',
-        'text-background-color': '#0f1419', 'text-background-opacity': 0.8, 'text-background-padding': 2
-      } },
-      { selector: 'edge.hot', style: { 'line-color': '#ff9f43', 'target-arrow-color': '#ff9f43' } },
-      { selector: 'edge:selected', style: { 'line-color': '#4ea1ff', 'target-arrow-color': '#4ea1ff' } }
-    ]
+    style: cyStyle('dark')
   });
   cy.on('tap', 'node', ev => showNode(nodes.get(ev.target.id())));
   cy.on('tap', 'edge', ev => showEdge(edges.get(ev.target.id())));
@@ -542,8 +727,8 @@ function render(final) {
       const cls = nodeClass(n);
       const label = labelOf(n);
       const data = {
-        id: n.key, label: label ? `${label}\n${short(n.addr)}` : short(n.addr), color: COLORS[cls],
-        size: n.seed ? 44 : isEndpoint(n) ? 34 : 26, seed: !!n.seed, flagged: n.flags.some(f => f.level === 'high')
+        id: n.key, label: (notes.nodes[n.key] ? '✎ ' : '') + (label ? `${label}\n${short(n.addr)}` : short(n.addr)), color: COLORS[cls],
+        size: n.seed ? 44 : isEndpoint(n) ? 34 : 26, seed: !!n.seed, flagged: n.flags.some(f => f.level === 'high'), noted: !!notes.nodes[n.key]
       };
       const el = cy.getElementById(n.key);
       if (el.nonempty()) el.data(data);
@@ -561,12 +746,14 @@ function render(final) {
       if (el.nonempty()) el.data(data); else cy.add({ group: 'edges', data });
       const tgt = nodes.get(e.target);
       cy.getElementById(e.key).toggleClass('hot', ['perp', 'suspect', 'sanction'].includes(nodeClass(tgt)));
+      cy.getElementById(e.key).toggleClass('upstream', !!nodes.get(e.source)?.upstream);
     }
     cy.nodes().forEach(el => { if (!nodes.has(el.id())) el.remove(); });
   });
   runLayout(final);
   renderFindings();
   $('#btnExportPng').disabled = $('#btnExportJson').disabled = nodes.size === 0;
+  renderOrigins();
 }
 
 function runLayout(fit) {
@@ -671,15 +858,28 @@ function showNode(n) {
     <div class="links">${osintLinks(n).map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`).join('')}</div>
     <div class="actions">
       <button class="ghost" data-act="expand">Verder traceren</button>
+      <button class="ghost" data-act="origins">Herkomst zoeken</button>
       <button class="ghost" data-act="copy">Kopieer adres</button>
       <button class="ghost" data-act="perp">Markeer dader</button>
       <button class="ghost" data-act="victim">Markeer slachtoffer</button>
       <button class="ghost" data-act="label">Label toevoegen</button>
       <button class="ghost" data-act="remove">Verwijder</button>
     </div>
+    <h4>Notitie</h4>
+    <textarea id="nodeNote" class="note" rows="3" placeholder="Bijv. bevestigd door slachtoffer, aangifte nr., contact exchange…">${esc(notes.nodes[n.key] || '')}</textarea>
     <h4>Transacties in het web</h4>
     <div class="txlist">${related.map(t => `<div><span class="${t.dir}">${t.dir === 'out' ? '→' : '←'} ${esc(t.cp ? (labelOf(t.cp) || short(t.cp.addr)) : '?')}</span><span>${fmt(t.value)} ${esc(t.asset)}</span><span>${fmtTime(t.time)}</span></div>`).join('') || '<em>Nog geen transacties opgehaald.</em>'}</div>`;
   $('#detailBody').querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => nodeAction(n, b.dataset.act)));
+  let t = null;
+  $('#nodeNote').addEventListener('input', ev => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      const v = ev.target.value.trim();
+      if (v) notes.nodes[n.key] = v; else delete notes.nodes[n.key];
+      saveNotes();
+      render(false);
+    }, 400);
+  });
   $('#detail').hidden = false;
 }
 
@@ -732,6 +932,17 @@ async function nodeAction(n, act) {
     cy.getElementById(n.key).remove();
     hideDetail(); render(false); return;
   }
+  if (act === 'origins') {
+    if (!current) return;
+    stopped = false;
+    setBusy(true);
+    await traceOrigins(n, { depth: 3, fanIn: Math.max(4, current.opts.fanout) });
+    setBusy(false);
+    render(true);
+    setStatus(`Herkomst: ${origins.starts.size} startwallets, ${origins.cashIn.length} instroom-transacties.`);
+    showNode(n);
+    return;
+  }
   if (act === 'expand') {
     if (!current) return;
     stopped = false;
@@ -767,16 +978,200 @@ function exportJson() {
   const dossier = {
     tool: 'ChainTrace', version: 1, exported: new Date().toISOString(),
     case: current && { chain: current.chain, role: current.role, pattern: window.PATTERNS[current.pattern].name, patternKey: current.pattern, seed: seed?.addr, started: current.started },
-    nodes: [...nodes.values()].map(n => ({ key: n.key, chain: n.chain, address: n.addr, label: labelOf(n), role: n.role, classification: nodeClass(n), hop: n.depth, flags: n.flags, seed: !!n.seed, hint: n.hint, parent: n.parent })),
+    nodes: [...nodes.values()].map(n => ({ key: n.key, chain: n.chain, address: n.addr, label: labelOf(n), role: n.role, classification: nodeClass(n), hop: n.depth, flags: n.flags, seed: !!n.seed, hint: n.hint, parent: n.parent, upstream: !!n.upstream })),
     edges: [...edges.values()].map(e => ({ ...e, first: e.first === Infinity ? null : e.first })),
+    origins: { rootKey: origins.rootKey, starts: [...origins.starts.values()], cashIn: origins.cashIn },
+    notes,
     customLabels
   };
   saveFile(`chaintrace-${short(seed?.addr || 'dossier').replace('…', '_')}-${stamp()}.json`, 'application/json', JSON.stringify(dossier, null, 2), false);
 }
 
-function exportPng() {
-  if (!cy) return;
-  saveFile(`chaintrace-${stamp()}.png`, 'image/png', cy.png({ full: true, scale: 2, bg: '#0f1419' }), true);
+function graphImage(themeName, maxWidth) {
+  const t = THEMES[themeName];
+  if (themeName !== 'dark') cy.style(cyStyle(themeName));
+  cy.$(':selected').unselect();
+  const bb = cy.elements().boundingBox();
+  const scale = Math.max(1, Math.min(4, maxWidth / Math.max(bb.w, 1), 9000 / Math.max(bb.h, 1)));
+  const uri = cy.png({ full: true, scale, bg: t.bg, padding: 30 });
+  if (themeName !== 'dark') cy.style(cyStyle('dark'));
+  return uri;
+}
+
+function loadImage(src) {
+  return new Promise((ok, fail) => { const img = new Image(); img.onload = () => ok(img); img.onerror = fail; img.src = src; });
+}
+
+// Rapport als één afbeelding: kop, grafiek, legenda, bevindingen, herkomst en notities.
+async function composeReport(opts) {
+  const t = THEMES[opts.theme];
+  const W = 2400, PAD = 70, INNER = W - 2 * PAD;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = 16000;
+  const ctx = canvas.getContext('2d');
+  const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  const MONO = 'ui-monospace, Consolas, "Roboto Mono", monospace';
+  const font = (size, weight = 400, mono = false) => { ctx.font = `${weight} ${size}px ${mono ? MONO : FONT}`; };
+  const text = (s, x, y, color = t.text) => { ctx.fillStyle = color; ctx.fillText(s, x, y); };
+  const wrap = (s, x, y, maxW, lh, color = t.text) => {
+    ctx.fillStyle = color;
+    let line = '';
+    for (const word of String(s).split(/\s+/)) {
+      const test = line ? line + ' ' + word : word;
+      if (ctx.measureText(test).width > maxW && line) { ctx.fillText(line, x, y); y += lh; line = word; } else line = test;
+    }
+    if (line) { ctx.fillText(line, x, y); y += lh; }
+    return y;
+  };
+  const fit = (s, maxW) => {
+    s = String(s);
+    if (ctx.measureText(s).width <= maxW) return s;
+    while (s.length > 4 && ctx.measureText(s + '…').width > maxW) s = s.slice(0, -1);
+    return s + '…';
+  };
+  const roundRect = (x, y, w, h, r, fill) => { ctx.fillStyle = fill; ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill(); };
+  const heading = (s, y) => { font(30, 700); text(s.toUpperCase(), PAD, y, t.muted); ctx.fillStyle = t.line; ctx.fillRect(PAD, y + 16, INNER, 2); return y + 60; };
+
+  ctx.fillStyle = t.bg;
+  ctx.fillRect(0, 0, W, canvas.height);
+  ctx.textBaseline = 'alphabetic';
+
+  // kop
+  const seed = nodes.get(current?.seedKey);
+  const pat = current ? window.PATTERNS[current.pattern] : null;
+  roundRect(0, 0, W, 300, 0, t.panel);
+  ctx.fillStyle = '#4ea1ff';
+  ctx.fillRect(0, 0, 14, 300);
+  font(56, 800); text('ChainTrace — onderzoeksrapport', PAD, 100);
+  font(30, 400);
+  text(`${pat?.name || 'Trace'} · ${current?.role === 'perp' ? 'startadres: dader' : 'startadres: slachtoffer'} · ${CHAIN_NAME[current?.chain] || ''}`, PAD, 158, t.muted);
+  font(32, 500, true); text(seed?.addr || '', PAD, 214);
+  font(26, 400); text(`Gegenereerd ${new Date().toLocaleString('nl-NL')}`, PAD, 262, t.muted);
+  const highs = [...nodes.values()].reduce((s, n) => s + n.flags.filter(f => f.level === 'high').length, 0);
+  const stats = [[nodes.size, 'adressen'], [edges.size, 'geldstromen'], [highs, 'rode vlaggen'], [origins.starts.size, 'startwallets']];
+  stats.forEach(([v, l], i) => {
+    const x = W - PAD - (stats.length - i) * 230 + 30;
+    font(60, 800); text(fmt(v), x, 150, i === 2 && v ? '#ff4d5e' : t.text);
+    font(24, 400); text(l, x, 192, t.muted);
+  });
+  let y = 360;
+
+  // grafiek
+  const img = await loadImage(graphImage(opts.theme, INNER * 1.5));
+  const gScale = Math.min(INNER / img.width, 1800 / img.height);
+  const gw = img.width * gScale, gh = img.height * gScale;
+  roundRect(PAD - 10, y - 10, INNER + 20, gh + 20, 24, t.panel);
+  ctx.drawImage(img, PAD + (INNER - gw) / 2, y, gw, gh);
+  y += gh + 50;
+
+  // legenda
+  font(26, 400);
+  let lx = PAD;
+  for (const [cls, name] of [['victim', 'Slachtoffer'], ['victim2', 'Mogelijk slachtoffer / startwallet'], ['perp', 'Dader'], ['suspect', 'Verdacht'], ['exchange', 'Exchange / dienst'], ['sanction', 'Sanctie / scamlijst'], ['plain', 'Onbekend']]) {
+    ctx.fillStyle = COLORS[cls]; ctx.beginPath(); ctx.arc(lx + 12, y - 9, 12, 0, Math.PI * 2); ctx.fill();
+    text(name, lx + 34, y, t.muted);
+    lx += 34 + ctx.measureText(name).width + 44;
+  }
+  ctx.strokeStyle = '#3fa7ff'; ctx.lineWidth = 4; ctx.setLineDash([12, 8]);
+  ctx.beginPath(); ctx.moveTo(lx, y - 9); ctx.lineTo(lx + 50, y - 9); ctx.stroke(); ctx.setLineDash([]);
+  text('herkomst (stroomopwaarts)', lx + 64, y, t.muted);
+  y += 70;
+
+  // herkomst: instroom via exchanges
+  if (opts.origins && origins.rootKey) {
+    y = heading(`Instroom via exchanges en diensten (${origins.cashIn.length})`, y);
+    const cash = [...origins.cashIn].sort((a, b) => (a.time || 0) - (b.time || 0)).slice(0, 40);
+    if (!cash.length) { font(26); text('Geen instroom via exchanges gevonden binnen de zoekdiepte.', PAD, y, t.muted); y += 50; }
+    else {
+      const cols = [[PAD, 'Exchange / dienst', 380], [PAD + 400, 'Tijdstip', 260], [PAD + 680, 'Bedrag', 300], [PAD + 1000, 'Naar wallet', 330], [PAD + 1350, 'Transactie-hash', INNER - 1350]];
+      font(24, 700); cols.forEach(([x, h]) => text(h, x, y, t.muted)); y += 14;
+      for (const [i, r] of cash.entries()) {
+        if (i % 2 === 0) roundRect(PAD - 12, y + 6, INNER + 24, 46, 8, t.panel);
+        y += 40;
+        font(25, 600); text(fit(r.name, cols[0][2]), cols[0][0], y);
+        font(25); text(fmtTime(r.time), cols[1][0], y);
+        text(fit(`${fmt(r.value)} ${r.asset}`, cols[2][2]), cols[2][0], y);
+        font(22, 400, true); text(short(nodes.get(r.to)?.addr || '?'), cols[3][0], y);
+        font(19, 400, true); text(fit(r.txid, cols[4][2]), cols[4][0], y, t.muted);
+        y += 6;
+      }
+      y += 50;
+    }
+    y = heading(`Startwallets — mogelijke slachtoffers / geldbronnen (${origins.starts.size})`, y);
+    const starts = [...origins.starts.values()].sort((a, b) => (b.usd - a.usd)).slice(0, 30);
+    if (!starts.length) { font(26); text('Geen startwallets gevonden.', PAD, y, t.muted); y += 50; }
+    for (const [i, r] of starts.entries()) {
+      const n = nodes.get(r.key);
+      if (i % 2 === 0) roundRect(PAD - 12, y - 32, INNER + 24, 50, 8, t.panel);
+      font(22, 400, true); text(r.addr, PAD, y);
+      font(25, 600); text(fit(assetText(r.assets), 360), PAD + 1060, y);
+      font(24); text(fit(`${(n && labelOf(n)) ? labelOf(n) + ' · ' : ''}${r.reason}${r.first ? ' · ' + fmtTime(r.first) : ''}`, INNER - 1440), PAD + 1440, y, t.muted);
+      y += 52;
+    }
+    y += 40;
+  }
+
+  // bevindingen
+  if (opts.findings) {
+    const order = { high: 0, med: 1, info: 2 };
+    const list = [];
+    for (const n of nodes.values()) for (const f of n.flags) if (!['contract', 'error', 'startwallet'].includes(f.code)) list.push({ n, f });
+    list.sort((a, b) => order[a.f.level] - order[b.f.level]);
+    y = heading(`Bevindingen (${list.length})`, y);
+    const lvlColor = { high: '#ff4d5e', med: '#ff9f43', info: '#2ecc71' };
+    for (const { n, f } of list.slice(0, 24)) {
+      ctx.fillStyle = lvlColor[f.level]; ctx.fillRect(PAD, y - 30, 8, 40);
+      font(26, 500); text(fit(f.text, 1300), PAD + 28, y);
+      font(21, 400, true); text(fit(`${labelOf(n) ? labelOf(n) + ' · ' : ''}${n.addr}`, INNER - 1360), PAD + 1360, y, t.muted);
+      y += 54;
+    }
+    if (list.length > 24) { font(24); text(`… en ${list.length - 24} meer (zie dossier-JSON)`, PAD + 28, y, t.muted); y += 50; }
+    y += 30;
+  }
+
+  // notities
+  const nodeNotes = Object.entries(notes.nodes).filter(([k]) => nodes.has(k));
+  if (opts.notes && (notes.case || nodeNotes.length)) {
+    y = heading('Notities', y);
+    if (notes.case) { font(27); for (const para of notes.case.split(/\n+/)) y = wrap(para, PAD, y, INNER, 40); y += 20; }
+    for (const [k, v] of nodeNotes) {
+      const n = nodes.get(k);
+      font(23, 600, true); text(`✎ ${labelOf(n) ? labelOf(n) + ' · ' : ''}${n.addr}`, PAD, y, t.muted); y += 40;
+      font(26); for (const para of v.split(/\n+/)) y = wrap(para, PAD + 34, y, INNER - 34, 38);
+      y += 18;
+    }
+    y += 20;
+  }
+
+  // voet
+  ctx.fillStyle = t.line; ctx.fillRect(PAD, y, INNER, 2); y += 46;
+  font(22);
+  y = wrap('Gemaakt met ChainTrace (open source, zonder login). Data: mempool.space, Blockscout, TronGrid, OFAC (0xB10C), ScamSniffer, GraphSense, Ransomwhere, Forta, Etherscan-labels, Tether-blacklist. Heuristieken en labels zijn aanwijzingen, geen bewijs; controleer transacties in een block explorer.', PAD, y, INNER, 32, t.muted);
+  y += 40;
+
+  const out = document.createElement('canvas');
+  out.width = W;
+  out.height = Math.ceil(y);
+  out.getContext('2d').drawImage(canvas, 0, 0);
+  return out.toDataURL('image/png');
+}
+
+async function exportReport(kind) {
+  if (!cy || !nodes.size) return;
+  const opts = {
+    theme: $('#expTheme').value,
+    origins: $('#expOrigins').checked, findings: $('#expFindings').checked, notes: $('#expNotes').checked
+  };
+  setStatus('Afbeelding maken…');
+  try {
+    const uri = kind === 'graph' ? graphImage(opts.theme, 4000) : await composeReport(opts);
+    saveFile(`chaintrace-${kind === 'graph' ? 'web' : 'rapport'}-${stamp()}.png`, 'image/png', uri, true);
+    setStatus('Afbeelding opgeslagen.');
+  } catch (err) {
+    setStatus('Exporteren mislukt: ' + err.message, true);
+  }
+  $('#exportDialog').close();
 }
 
 function importJson(text) {
@@ -789,9 +1184,14 @@ function importJson(text) {
   Object.assign(customLabels, d.customLabels || {});
   for (const x of d.nodes) {
     const n = getNode(x.chain, x.address);
-    Object.assign(n, { role: x.role, flags: x.flags || [], seed: x.seed, depth: x.hop, hint: x.hint, parent: x.parent, expanded: true });
+    Object.assign(n, { role: x.role, flags: x.flags || [], seed: x.seed, depth: x.hop, hint: x.hint, parent: x.parent, upstream: x.upstream, expanded: true });
   }
   for (const e of d.edges) edges.set(e.key, { ...e, first: e.first ?? Infinity });
+  origins.rootKey = d.origins?.rootKey || null;
+  origins.starts = new Map((d.origins?.starts || []).map(r => [r.key, r]));
+  origins.cashIn = d.origins?.cashIn || [];
+  loadNotes();
+  if (d.notes) { notes = { case: d.notes.case || '', nodes: d.notes.nodes || {} }; $('#caseNote').value = notes.case; saveNotes(); }
   render(true);
   renderPlaybook();
   setStatus(`Dossier geladen: ${nodes.size} adressen.`);
@@ -800,6 +1200,7 @@ function importJson(text) {
 // ---------- UI ----------
 function resetGraph() {
   nodes.clear(); edges.clear();
+  origins.rootKey = null; origins.starts = new Map(); origins.cashIn = [];
   if (cy) cy.elements().remove();
   hideDetail();
   $('#playbook').hidden = true;
@@ -855,7 +1256,12 @@ function setup() {
   $('#btnStop').addEventListener('click', () => { stopped = true; abortCtl.abort(); setBusy(false); setStatus('Gestopt.'); render(true); });
   $('#detailClose').addEventListener('click', hideDetail);
   $('#btnExportJson').addEventListener('click', exportJson);
-  $('#btnExportPng').addEventListener('click', exportPng);
+  $('#btnExportPng').addEventListener('click', () => $('#exportDialog').showModal());
+  $('#btnExpReport').addEventListener('click', () => exportReport('report'));
+  $('#btnExpGraph').addEventListener('click', () => exportReport('graph'));
+  $('#btnExpClose').addEventListener('click', () => $('#exportDialog').close());
+  $('#btnOriginsCsv').addEventListener('click', () => saveFile(`chaintrace-herkomst-${stamp()}.csv`, 'text/csv', '\ufeff' + originsCsv(), false));
+  $('#caseNote').addEventListener('input', ev => { notes.case = ev.target.value; saveNotes(); });
   $('#fileImport').addEventListener('change', async ev => {
     const f = ev.target.files[0];
     if (!f) return;
@@ -931,5 +1337,5 @@ function setupDbDialog() {
 
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { runTrace, nodes, edges, detectChain };
+window.ChainTrace = { runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, notes: () => notes };
 })();

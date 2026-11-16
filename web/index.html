@@ -17,7 +17,7 @@
   </div>
   <div class="top-actions">
     <button id="btnDb" class="ghost" hidden>Database</button>
-    <button id="btnExportPng" class="ghost" disabled>PNG</button>
+    <button id="btnExportPng" class="ghost" disabled>Afbeelding</button>
     <button id="btnExportJson" class="ghost" disabled>Dossier</button>
     <label class="ghost filebtn">Importeer<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
   </div>
@@ -71,6 +71,19 @@
       <div id="status" class="status" aria-live="polite"></div>
     </form>
 
+    <div class="origins" id="origins" hidden>
+      <h2>Herkomst van het geld <button id="btnOriginsCsv" class="mini" type="button">CSV</button></h2>
+      <h3>Instroom via exchanges <span id="cashCount" class="badge">0</span></h3>
+      <ul id="cashList" class="olist"></ul>
+      <h3>Startwallets · mogelijke slachtoffers <span id="startCount" class="badge">0</span></h3>
+      <ul id="startList" class="olist"></ul>
+    </div>
+
+    <div class="notesbox" id="notesBox" hidden>
+      <h2>Notities bij deze zaak</h2>
+      <textarea id="caseNote" class="note" rows="4" placeholder="Aangiftenummer, contact met exchange, verklaringen, vervolgstappen…"></textarea>
+    </div>
+
     <div class="findings">
       <h2>Bevindingen <span id="findCount" class="badge">0</span></h2>
       <ul id="findings"></ul>
@@ -118,6 +131,24 @@
   <ul id="dbResults" class="dbresults"></ul>
   <table class="srctable"><thead><tr><th>Bron</th><th class="num">Records</th><th>Status</th><th>Bijgewerkt</th></tr></thead><tbody id="dbSources"></tbody></table>
   <button id="btnDbSync" class="primary" type="button">Nu bijwerken</button>
+</dialog>
+
+<dialog id="exportDialog" class="dlg dlg-small">
+  <div class="dlg-head">
+    <h2>Afbeelding exporteren</h2>
+    <button class="close" id="btnExpClose" type="button" aria-label="Sluiten">×</button>
+  </div>
+  <label class="field"><span>Thema</span>
+    <select id="expTheme"><option value="light">Licht (print / rapport)</option><option value="dark">Donker (scherm)</option></select>
+  </label>
+  <div class="field checks">
+    <span>Inhoud rapport</span>
+    <label><input type="checkbox" id="expOrigins" checked> Herkomst: exchange-instroom en startwallets</label>
+    <label><input type="checkbox" id="expFindings" checked> Bevindingen</label>
+    <label><input type="checkbox" id="expNotes" checked> Notities</label>
+  </div>
+  <button id="btnExpReport" class="primary" type="button">Volledig rapport (PNG)</button>
+  <button id="btnExpGraph" class="ghost wide" type="button">Alleen het web (PNG, hoge resolutie)</button>
 </dialog>
 
 <footer class="foot">

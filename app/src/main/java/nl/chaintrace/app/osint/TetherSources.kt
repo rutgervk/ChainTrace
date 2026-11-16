@@ -44,7 +44,7 @@ class TetherTronSource : OsintSource("tether_tron", "Tether-bevriezingen (Tron)"
                 db.recordFreezes("tron", events)
                 db.setKv(key, cursor.toString())
                 next = o.optJSONObject("meta")?.optJSONObject("links")?.optString("next")?.ifBlank { null }
-                Thread.sleep(400)
+                Thread.sleep(1_100) // TronGrid zonder sleutel: ~1 verzoek/s
             }
         }
     }
