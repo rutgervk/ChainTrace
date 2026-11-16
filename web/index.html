@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChainTrace</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⛓</span>
+    <div>
+      <h1>ChainTrace</h1>
+      <p class="sub">Open-source blockchain-onderzoek · geen login · OSINT</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <button id="btnExportPng" class="ghost" disabled>PNG</button>
+    <button id="btnExportJson" class="ghost" disabled>Dossier</button>
+    <label class="ghost filebtn">Importeer<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="panel form-panel">
+    <form id="traceForm" autocomplete="off">
+      <label class="field">
+        <span>Walletadres</span>
+        <input id="addr" type="text" spellcheck="false" placeholder="bc1… / 1… / 3… · 0x… · T…" required>
+        <small id="chainHint" class="hint">Keten wordt automatisch herkend</small>
+      </label>
+
+      <label class="field">
+        <span>Keten</span>
+        <select id="chain">
+          <option value="auto">Automatisch</option>
+          <option value="btc">Bitcoin</option>
+          <option value="eth">Ethereum (ETH + ERC-20)</option>
+          <option value="op">Optimism (ETH + ERC-20)</option>
+          <option value="tron">Tron (TRC-20, o.a. USDT)</option>
+        </select>
+      </label>
+
+      <fieldset class="field">
+        <span>Rol van dit adres</span>
+        <div class="seg">
+          <input type="radio" name="role" id="roleVictim" value="victim" checked>
+          <label for="roleVictim" class="victim">Slachtoffer</label>
+          <input type="radio" name="role" id="rolePerp" value="perp">
+          <label for="rolePerp" class="perp">Dader</label>
+        </div>
+      </fieldset>
+
+      <label class="field">
+        <span>Fraudepatroon</span>
+        <select id="pattern"></select>
+        <small id="patternInfo" class="hint"></small>
+      </label>
+
+      <details class="field adv">
+        <summary>Geavanceerd</summary>
+        <label class="row"><span>Diepte (hops)</span><input id="depth" type="number" min="1" max="4" value="2"></label>
+        <label class="row"><span>Max. tegenpartijen per adres</span><input id="fanout" type="number" min="2" max="25" value="6"></label>
+        <label class="row"><span>Max. adressen totaal</span><input id="maxNodes" type="number" min="10" max="300" value="80"></label>
+      </details>
+
+      <button type="submit" id="btnTrace" class="primary">Traceer &amp; bouw web</button>
+      <button type="button" id="btnStop" class="ghost" hidden>Stop</button>
+      <div id="status" class="status" aria-live="polite"></div>
+    </form>
+
+    <div class="findings">
+      <h2>Bevindingen <span id="findCount" class="badge">0</span></h2>
+      <ul id="findings"></ul>
+    </div>
+
+    <div class="playbook" id="playbook" hidden>
+      <h2>Vervolgstappen</h2>
+      <ol id="playbookList"></ol>
+    </div>
+  </section>
+
+  <section class="graph-wrap">
+    <div id="cy"></div>
+    <div class="graph-tools">
+      <button id="btnLayoutWeb" class="chip active" type="button">Web</button>
+      <button id="btnLayoutFlow" class="chip" type="button">Stroom</button>
+      <button id="btnFit" class="chip" type="button">Passend</button>
+    </div>
+    <div class="legend">
+      <span><i class="dot victim"></i>Slachtoffer</span>
+      <span><i class="dot perp"></i>Dader</span>
+      <span><i class="dot suspect"></i>Verdacht</span>
+      <span><i class="dot exchange"></i>Exchange/dienst</span>
+      <span><i class="dot sanction"></i>Sanctie/scam-lijst</span>
+      <span><i class="dot plain"></i>Onbekend</span>
+    </div>
+    <div id="empty" class="empty">
+      <p>Voer een adres in, kies <b>slachtoffer</b> of <b>dader</b> en een fraudepatroon.<br>Het geldstroom-web wordt live opgebouwd.</p>
+    </div>
+  </section>
+
+  <aside class="panel detail-panel" id="detail" hidden>
+    <button class="close" id="detailClose" type="button" aria-label="Sluiten">×</button>
+    <div id="detailBody"></div>
+  </aside>
+</main>
+
+<footer class="foot">
+  Data: mempool.space · Blockscout · TronGrid · OFAC-lijst (0xB10C) · ScamSniffer. Heuristieken zijn aanwijzingen, geen bewijs.
+</footer>
+
+<script src="vendor/cytoscape.min.js"></script>
+<script src="patterns.js"></script>
+<script src="labels.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

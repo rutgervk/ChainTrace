@@ -1,0 +1,822 @@
+(() => {
+'use strict';
+
+const $ = s => document.querySelector(s);
+const API = {
+  btc: 'https://mempool.space/api',
+  eth: 'https://eth.blockscout.com/api/v2',
+  op: 'https://explorer.optimism.io/api/v2',
+  tron: 'https://api.trongrid.io'
+};
+const CHAIN_NAME = { btc: 'Bitcoin', eth: 'Ethereum', op: 'Optimism', tron: 'Tron' };
+const OFAC_LISTS = { btc: ['XBT'], eth: ['ETH', 'USDT', 'USDC'], op: ['ETH', 'USDT', 'USDC'], tron: ['TRX', 'USDT'] };
+const TRON_STABLES = { TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t: 'USDT', TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8: 'USDC' };
+const SERVICE_TX_THRESHOLD = 5000;
+const isEvm = c => c === 'eth' || c === 'op';
+
+// ---------- hulpfuncties ----------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const short = a => a.length > 14 ? a.slice(0, 6) + '…' + a.slice(-4) : a;
+const norm = (chain, a) => isEvm(chain) ? a.toLowerCase() : a;
+const keyOf = (chain, a) => chain + ':' + norm(chain, a);
+function fmt(v) {
+  if (!isFinite(v)) return '?';
+  const abs = Math.abs(v);
+  if (abs >= 1000) return v.toLocaleString('nl-NL', { maximumFractionDigits: 0 });
+  if (abs >= 1) return v.toLocaleString('nl-NL', { maximumFractionDigits: 2 });
+  return v.toLocaleString('nl-NL', { maximumSignificantDigits: 4 });
+}
+const fmtTime = t => t ? new Date(t * 1000).toLocaleString('nl-NL', { dateStyle: 'short', timeStyle: 'short' }) : '?';
+
+function detectChain(a) {
+  a = a.trim();
+  if (/^0x[a-fA-F0-9]{40}$/.test(a)) return 'eth';
+  if (/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(a)) return 'tron';
+  if (/^(bc1[a-z0-9]{25,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/.test(a)) return 'btc';
+  return null;
+}
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* opslag niet beschikbaar */ } }
+};
+let customLabels = store.get('chaintrace.labels', {});
+
+// ---------- HTTP met wachtrij, cache en retry ----------
+const MAX_PAR = 3;
+let running = 0;
+const waiting = [];
+const cache = new Map();
+let abortCtl = new AbortController();
+
+function acquire() { return new Promise(r => { if (running < MAX_PAR) { running++; r(); } else waiting.push(r); }); }
+function release() { const next = waiting.shift(); if (next) next(); else running--; }
+
+function getData(url, asText = false) {
+  if (cache.has(url)) return cache.get(url);
+  const p = (async () => {
+    await acquire();
+    try {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const r = await fetch(url, { signal: abortCtl.signal });
+        if (r.status === 429 || r.status >= 500) { await sleep(700 * 2 ** attempt); continue; }
+        if (r.status === 404 || r.status === 400) return null;
+        if (!r.ok) throw new Error(`HTTP ${r.status} van ${new URL(url).host}`);
+        return asText ? r.text() : r.json();
+      }
+      throw new Error('Rate limit bij ' + new URL(url).host);
+    } finally { release(); }
+  })();
+  cache.set(url, p);
+  p.catch(() => cache.delete(url));
+  return p;
+}
+
+// ---------- OSINT-lijsten ----------
+const osint = { ofac: new Set(), ofacLoaded: new Set(), scam: null };
+async function loadLists(chain) {
+  await Promise.all(OFAC_LISTS[chain].map(async sym => {
+    if (osint.ofacLoaded.has(sym)) return;
+    const txt = await getData(`https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_${sym}.txt`, true).catch(() => null);
+    if (!txt) return;
+    for (const a of txt.split(/\s+/)) if (a) osint.ofac.add(a.startsWith('0x') ? a.toLowerCase() : a);
+    osint.ofacLoaded.add(sym);
+  }));
+  if (isEvm(chain) && !osint.scam) {
+    const arr = await getData('https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/address.json').catch(() => null);
+    if (arr) osint.scam = new Set(arr.map(a => a.toLowerCase()));
+  }
+}
+
+// ---------- ketenspecifiek ophalen → genormaliseerde transfers ----------
+async function fetchBtc(addr) {
+  const [info, txs] = await Promise.all([
+    getData(`${API.btc}/address/${addr}`),
+    getData(`${API.btc}/address/${addr}/txs`)
+  ]);
+  let all = txs || [];
+  const conf = all.filter(t => t.status?.confirmed);
+  if (conf.length >= 25) {
+    const more = await getData(`${API.btc}/address/${addr}/txs/chain/${conf[conf.length - 1].txid}`).catch(() => null);
+    if (more) all = all.concat(more);
+  }
+  const transfers = [];
+  let peelCount = 0;
+  for (const tx of all) {
+    const ins = [...new Set(tx.vin.map(v => v.prevout?.scriptpubkey_address).filter(Boolean))];
+    const outs = tx.vout.filter(o => o.scriptpubkey_address).map(o => ({ a: o.scriptpubkey_address, v: o.value / 1e8 }));
+    const time = tx.status?.block_time || Math.floor(Date.now() / 1000);
+    if (ins.includes(addr)) {
+      // uitgaand; outputs terug naar een input-adres behandelen we als wisselgeld
+      for (const o of outs) if (!ins.includes(o.a)) transfers.push({ from: addr, to: o.a, value: o.v, asset: 'BTC', time, txid: tx.txid });
+      if (outs.length === 2) {
+        const total = outs[0].v + outs[1].v;
+        if (total > 0 && Math.max(outs[0].v, outs[1].v) / total >= 0.8) peelCount++;
+      }
+    } else {
+      const recv = outs.filter(o => o.a === addr).reduce((s, o) => s + o.v, 0);
+      if (recv > 0) for (const i of ins) transfers.push({ from: i, to: addr, value: recv / ins.length, asset: 'BTC', time, txid: tx.txid });
+    }
+  }
+  const cs = info?.chain_stats;
+  return {
+    transfers, peelCount, meta: {},
+    txCount: cs?.tx_count ?? all.length,
+    balance: cs ? `${fmt((cs.funded_txo_sum - cs.spent_txo_sum) / 1e8)} BTC` : null
+  };
+}
+
+async function fetchEvm(chain, addr) {
+  const B = API[chain];
+  const [info, counters, txs, tts] = await Promise.all([
+    getData(`${B}/addresses/${addr}`).catch(() => null),
+    getData(`${B}/addresses/${addr}/counters`).catch(() => null),
+    getData(`${B}/addresses/${addr}/transactions`),
+    getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20`)
+  ]);
+  const meta = {};
+  const take = o => {
+    if (!o?.hash) return null;
+    const k = o.hash.toLowerCase();
+    const m = meta[k] || (meta[k] = { tags: [] });
+    const tags = [
+      ...(o.metadata?.tags || []).map(t => t.name),
+      ...(o.public_tags || []).map(t => t.display_name || t.label)
+    ].filter(Boolean);
+    for (const t of tags) if (!m.tags.includes(t)) m.tags.push(t);
+    if (o.name) m.name = o.name;
+    if (o.ens_domain_name) m.ens = o.ens_domain_name;
+    if (o.is_scam) m.scam = true;
+    if (o.is_contract) m.contract = true;
+    if (o.reputation && o.reputation !== 'ok') m.reputation = o.reputation;
+    return k;
+  };
+  if (info) take(info);
+  const transfers = [];
+  for (const tx of txs?.items || []) {
+    const f = take(tx.from), t = take(tx.to);
+    const v = Number(tx.value) / 1e18;
+    if (!f || !t || !(v > 0) || tx.status === 'error') continue;
+    transfers.push({
+      from: f, to: t, value: v, asset: 'ETH', time: Date.parse(tx.timestamp) / 1000, txid: tx.hash,
+      usd: tx.exchange_rate ? v * Number(tx.exchange_rate) : null
+    });
+  }
+  for (const tt of tts?.items || []) {
+    const f = take(tt.from), t = take(tt.to);
+    if (!f || !t) continue;
+    const dec = Number(tt.total?.decimals ?? tt.token?.decimals ?? 18);
+    const v = Number(tt.total?.value || 0) / 10 ** dec;
+    const rate = tt.token?.exchange_rate;
+    const spam = tt.token?.reputation && tt.token.reputation !== 'ok';
+    transfers.push({
+      from: f, to: t, value: v, asset: tt.token?.symbol || '?', time: Date.parse(tt.timestamp) / 1000,
+      txid: tt.transaction_hash, usd: rate && !spam ? v * Number(rate) : null,
+      dust: v === 0 || spam || (!rate && /^(USDT|USDC|DAI|WETH|ETH)$/i.test(tt.token?.symbol || ''))
+    });
+  }
+  const txCount = Number(counters?.transactions_count || 0) + Number(counters?.token_transfers_count || 0);
+  return {
+    transfers, meta, txCount: txCount || null,
+    balance: info ? `${fmt(Number(info.coin_balance || 0) / 1e18)} ETH` : null
+  };
+}
+
+async function fetchTron(addr) {
+  const r = await getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200`);
+  const transfers = (r?.data || []).map(d => {
+    const dec = Number(d.token_info?.decimals ?? 6);
+    const v = Number(d.value) / 10 ** dec;
+    const sym = d.token_info?.symbol || '?';
+    const real = TRON_STABLES[d.token_info?.address];
+    return {
+      from: d.from, to: d.to, value: v, asset: sym, time: d.block_timestamp / 1000, txid: d.transaction_id,
+      usd: real ? v : null,
+      // nep-USDT (zelfde symbool, ander contract) en 0-transfers zijn klassiek bij address poisoning
+      dust: v === 0 || (!real && /^(USDT|USDC|TUSD)$/i.test(sym))
+    };
+  });
+  return { transfers, meta: {}, txCount: null, balance: null };
+}
+
+function fetchAddr(chain, addr) {
+  if (chain === 'btc') return fetchBtc(addr);
+  if (isEvm(chain)) return fetchEvm(chain, addr);
+  return fetchTron(addr);
+}
+
+// ---------- grafiekmodel ----------
+const nodes = new Map();
+const edges = new Map();
+const metaStore = {};
+let current = null; // { seedKey, chain, role, pattern, opts }
+let stopped = false;
+
+const EXCHANGE_RE = /binance|coinbase|kraken|okx|okex|bybit|kucoin|bitfinex|huobi|htx|gate\.io|gate\b|bitget|mexc|crypto\.com|bitvavo|gemini|bitstamp|upbit|poloniex|exchange|hot ?wallet|deposit/i;
+const MIXER_RE = /tornado|mixer|sinbad|blender|wasabi|samourai|railgun/i;
+const BAD_RE = /phish|scam|hack|exploit|drainer|fake|heist|ponzi/i;
+const BRIDGE_RE = /bridge|wormhole|stargate|across|hop protocol|multichain|synapse/i;
+
+function getNode(chain, addr) {
+  const k = keyOf(chain, addr);
+  let n = nodes.get(k);
+  if (!n) {
+    n = { key: k, chain, addr: norm(chain, addr), role: null, flags: [], data: null, expanded: false, depth: 0, hint: null };
+    nodes.set(k, n);
+  }
+  return n;
+}
+
+function labelOf(n) {
+  if (customLabels[n.key]) return customLabels[n.key];
+  const known = window.KNOWN_LABELS[n.addr] || window.KNOWN_LABELS[Object.keys(window.KNOWN_LABELS).find(k => k.toLowerCase() === n.addr) || ''];
+  if (known) return known.name;
+  const m = metaStore[n.key];
+  if (m?.tags?.length) return m.tags[0];
+  if (m?.ens) return m.ens;
+  if (m?.name) return m.name;
+  return null;
+}
+
+function addFlag(n, code, level, text) {
+  if (!n.flags.some(f => f.code === code)) n.flags.push({ code, level, text });
+}
+
+// Lichte analyse: alleen lokale lijsten en metadata, zonder extra API-call.
+function lightAnalyze(n) {
+  const lower = n.addr.toLowerCase();
+  if (osint.ofac.has(n.addr) || osint.ofac.has(lower)) addFlag(n, 'sanction', 'high', 'Op OFAC-sanctielijst');
+  if (isEvm(n.chain) && osint.scam?.has(lower)) addFlag(n, 'scamlist', 'high', 'Op ScamSniffer-blacklist');
+  const m = metaStore[n.key];
+  const known = window.KNOWN_LABELS[n.addr];
+  const text = [customLabels[n.key], known?.name, ...(m?.tags || []), m?.name].filter(Boolean).join(' ');
+  if (m?.scam) addFlag(n, 'scamlist', 'high', 'Door Blockscout als scam gemarkeerd');
+  if (m?.reputation) addFlag(n, 'reputation', 'med', `Reputatie: ${m.reputation}`);
+  if (MIXER_RE.test(text)) addFlag(n, 'mixer', 'high', 'Mixer / privacy-dienst');
+  else if (BAD_RE.test(text)) addFlag(n, 'badtag', 'high', 'Publiek label wijst op fraude/hack');
+  if (known?.type === 'exchange' || EXCHANGE_RE.test(text)) addFlag(n, 'exchange', 'info', 'Exchange — cash-out-punt, bevriezing/informatieverzoek mogelijk');
+  if (BRIDGE_RE.test(text)) addFlag(n, 'bridge', 'med', 'Bridge — geld gaat naar een andere keten');
+  if (m?.contract || known?.type === 'contract') addFlag(n, 'contract', 'info', 'Smart contract');
+}
+
+function fullAnalyze(n) {
+  lightAnalyze(n);
+  const d = n.data;
+  if (!d) return;
+  const own = n.addr;
+  const ins = d.transfers.filter(t => t.to === own && t.from !== own && !t.dust);
+  const outs = d.transfers.filter(t => t.from === own && t.to !== own && !t.dust);
+  const times = d.transfers.map(t => t.time).filter(Boolean);
+  const spanDays = times.length ? (Math.max(...times) - Math.min(...times)) / 86400 : 999;
+  if ((d.txCount && d.txCount >= SERVICE_TX_THRESHOLD) || (d.transfers.length >= 45 && spanDays < 1)) {
+    addFlag(n, 'service', 'info', `Zeer actief (${d.txCount ? fmt(d.txCount) + ' tx' : 'veel tx per dag'}) — waarschijnlijk exchange/dienst`);
+  }
+  const senders = new Set(ins.map(t => t.from)), receivers = new Set(outs.map(t => t.to));
+  if (senders.size >= 10) addFlag(n, 'fanin', 'med', `Fan-in: ${senders.size} verschillende afzenders (verzameladres)`);
+  if (receivers.size >= 10) addFlag(n, 'fanout', 'med', `Fan-out: ${receivers.size} ontvangers (verspreiding/layering)`);
+  if (ins.length >= 2 && outs.length) {
+    const outTimes = outs.map(t => t.time).sort((a, b) => a - b);
+    const quick = ins.filter(t => outTimes.some(o => o >= t.time && o - t.time <= 3600)).length;
+    if (quick / ins.length >= 0.6) addFlag(n, 'passthrough', 'med', `Doorsluisadres: ${Math.round(100 * quick / ins.length)}% binnen 1 uur doorgestort`);
+  }
+  if (d.peelCount >= 3) addFlag(n, 'peel', 'med', `Peel chain-patroon (${d.peelCount} splitsingen)`);
+  const dust = d.transfers.filter(t => t.dust && t.to === own).length;
+  if (dust) addFlag(n, 'dust', 'info', `${dust} nul-/nep-tokentransfer(s) ontvangen (poisoning-kenmerk)`);
+}
+
+const isEndpoint = n => n.flags.some(f => ['exchange', 'service', 'mixer', 'sanction', 'contract', 'bridge'].includes(f.code));
+
+function fingerprint(chain, a) {
+  const s = isEvm(chain) ? a.toLowerCase().slice(2) : chain === 'tron' ? a.slice(1) : a.replace(/^bc1/, '');
+  return s.slice(0, 4) + '|' + s.slice(-4);
+}
+
+// Zoek adresparen die op elkaar lijken (zelfde begin en eind): address poisoning.
+function detectLookalikes(n, cps) {
+  const byFp = new Map();
+  for (const cp of cps) {
+    const fp = fingerprint(n.chain, cp);
+    if (!byFp.has(fp)) byFp.set(fp, new Set());
+    byFp.get(fp).add(cp);
+  }
+  const found = [];
+  for (const set of byFp.values()) {
+    if (set.size < 2) continue;
+    const arr = [...set];
+    for (const a of arr) {
+      const other = arr.find(x => x !== a);
+      const dusty = n.data.transfers.some(t => t.dust && (t.from === a || t.to === a));
+      found.push({ addr: a, other, dusty });
+    }
+  }
+  return found;
+}
+
+function addEdge(chain, from, to, t) {
+  const k = `${keyOf(chain, from)}>${keyOf(chain, to)}`;
+  let e = edges.get(k);
+  if (!e) { e = { key: k, source: keyOf(chain, from), target: keyOf(chain, to), assets: {}, count: 0, usd: 0, first: Infinity, last: 0, txs: [] }; edges.set(k, e); }
+  if (e.txs.some(x => x.txid === t.txid && x.asset === t.asset && x.value === t.value)) return;
+  e.assets[t.asset] = (e.assets[t.asset] || 0) + t.value;
+  e.count++;
+  e.usd += t.usd || 0;
+  e.first = Math.min(e.first, t.time);
+  e.last = Math.max(e.last, t.time);
+  if (e.txs.length < 50) e.txs.push({ txid: t.txid, value: t.value, asset: t.asset, time: t.time });
+}
+
+async function expand(n, depth, dir) {
+  if (stopped || n.expanded) return [];
+  n.expanded = true;
+  n.depth = Math.min(n.depth || depth, depth);
+  setStatus(`Ophalen ${short(n.addr)} (hop ${depth})…`);
+  try {
+    n.data = await fetchAddr(n.chain, n.addr);
+  } catch (err) {
+    if (err.name === 'AbortError') return [];
+    addFlag(n, 'error', 'info', 'Ophalen mislukt: ' + err.message);
+    scheduleRender();
+    return [];
+  }
+  for (const [k, m] of Object.entries(n.data.meta)) {
+    const key = n.chain + ':' + k;
+    const cur = metaStore[key] || (metaStore[key] = { tags: [] });
+    for (const t of m.tags) if (!cur.tags.includes(t)) cur.tags.push(t);
+    Object.assign(cur, { ...m, tags: cur.tags });
+  }
+  fullAnalyze(n);
+  if (depth > 0 && isEndpoint(n)) { scheduleRender(); return []; }
+
+  const { opts, pattern } = current;
+  const pat = window.PATTERNS[pattern];
+  const agg = new Map();
+  for (const t of n.data.transfers) {
+    let d, cp;
+    if (t.from === n.addr && t.to !== n.addr) { d = 'out'; cp = t.to; }
+    else if (t.to === n.addr && t.from !== n.addr) { d = 'in'; cp = t.from; }
+    else continue;
+    if (dir !== 'both' && d !== dir) continue;
+    const k = d + '|' + cp;
+    const a = agg.get(k) || { d, cp, rank: 0, count: 0, dustOnly: true, list: [] };
+    a.rank += t.usd ?? (n.chain === 'btc' ? t.value : 0);
+    a.count++;
+    if (!t.dust) a.dustOnly = false;
+    a.list.push(t);
+    agg.set(k, a);
+  }
+
+  const looks = detectLookalikes(n, [...new Set([...agg.values()].map(a => a.cp))]);
+  const lookSet = new Set(looks.map(l => l.addr));
+  const wantDust = pat.focus.includes('lookalike') || pat.focus.includes('dust');
+  const pick = d => [...agg.values()]
+    .filter(a => a.d === d && (!a.dustOnly || (wantDust && lookSet.has(a.cp))))
+    .sort((x, y) => (lookSet.has(y.cp) - lookSet.has(x.cp)) || (y.rank - x.rank) || (y.count - x.count))
+    .slice(0, opts.fanout);
+
+  const next = [];
+  for (const a of [...pick('out'), ...pick('in')]) {
+    if (nodes.size >= opts.maxNodes && !nodes.has(keyOf(n.chain, a.cp))) break;
+    const isNew = !nodes.has(keyOf(n.chain, a.cp));
+    const cn = getNode(n.chain, a.cp);
+    if (isNew) { cn.depth = depth + 1; cn.parent = n.key; }
+    for (const t of a.list) if (!t.dust || lookSet.has(a.cp)) addEdge(n.chain, t.from, t.to, t);
+    lightAnalyze(cn);
+    if (!cn.role) {
+      if (depth === 0 && a.d === 'out' && current.role === 'victim' && !isEndpoint(cn)) cn.hint = 'suspect';
+      if (depth === 0 && a.d === 'in' && current.role === 'perp' && !isEndpoint(cn)) cn.hint = 'victim2';
+    }
+    const look = looks.find(l => l.addr === a.cp);
+    if (look) {
+      addFlag(cn, 'lookalike', look.dusty ? 'high' : 'med',
+        `Lijkt op ${short(look.other)} (zelfde begin/eind) — ${look.dusty ? 'waarschijnlijk vergiftigingsadres' : 'vergelijk zorgvuldig'}`);
+      if (look.dusty) cn.hint = 'suspect';
+    }
+    // Upstream (inkomend) volgen we niet verder: dat zijn bronnen/slachtoffers, niet de geldroute.
+    if (a.d === 'out' && depth + 1 < opts.depth && !isEndpoint(cn)) next.push({ n: cn, depth: depth + 1, dir: 'out' });
+  }
+  scheduleRender();
+  return next;
+}
+
+async function runTrace(addr, chain, role, pattern, opts) {
+  abortCtl.abort();
+  abortCtl = new AbortController();
+  stopped = false;
+  resetGraph();
+  current = { chain, role, pattern, opts, seedKey: keyOf(chain, addr), started: new Date().toISOString() };
+  setBusy(true);
+  setStatus('OSINT-lijsten laden (OFAC, ScamSniffer)…');
+  await loadLists(chain);
+  const seed = getNode(chain, addr);
+  seed.role = role;
+  seed.seed = true;
+  lightAnalyze(seed);
+  scheduleRender();
+  let level = [{ n: seed, depth: 0, dir: window.PATTERNS[pattern].dir[role] }];
+  while (level.length && !stopped) {
+    const results = await Promise.all(level.map(x => expand(x.n, x.depth, x.dir)));
+    level = results.flat().filter(x => !x.n.expanded);
+  }
+  setBusy(false);
+  render(true);
+  renderPlaybook();
+  setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen.`);
+}
+
+// ---------- weergave ----------
+let cy = null;
+let layoutName = 'web';
+let renderTimer = null;
+
+const COLORS = { victim: '#3fa7ff', victim2: '#8cc8ff', perp: '#ff4d5e', suspect: '#ff9f43', exchange: '#2ecc71', sanction: '#b0004f', plain: '#6b7785' };
+
+function nodeClass(n) {
+  if (n.role) return n.role;
+  if (n.flags.some(f => ['sanction', 'scamlist', 'mixer', 'badtag'].includes(f.code))) return 'sanction';
+  if (n.flags.some(f => f.code === 'lookalike' && f.level === 'high')) return 'perp';
+  if (n.flags.some(f => ['exchange', 'service'].includes(f.code))) return 'exchange';
+  if (n.hint === 'suspect' || n.flags.some(f => ['passthrough', 'fanin', 'peel', 'lookalike'].includes(f.code))) return 'suspect';
+  if (n.hint === 'victim2') return 'victim2';
+  return 'plain';
+}
+
+function edgeLabel(e) {
+  const parts = Object.entries(e.assets).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([s, v]) => `${fmt(v)} ${s}`);
+  return parts.join(' + ') + (e.count > 1 ? ` (${e.count}×)` : '');
+}
+
+function initCy() {
+  cy = cytoscape({
+    container: $('#cy'),
+    minZoom: 0.1, maxZoom: 3,
+    style: [
+      { selector: 'node', style: {
+        'background-color': 'data(color)', label: 'data(label)', color: '#e6edf3', 'font-size': 10,
+        'text-valign': 'bottom', 'text-wrap': 'wrap', 'text-margin-y': 4, 'text-outline-color': '#0f1419', 'text-outline-width': 2,
+        width: 'data(size)', height: 'data(size)', 'border-width': 2, 'border-color': '#0f1419'
+      } },
+      { selector: 'node[?seed]', style: { 'border-width': 4, 'border-color': '#ffffff', 'font-weight': 'bold', 'font-size': 12 } },
+      { selector: 'node[?flagged]', style: { 'border-color': '#ff4d5e', 'border-style': 'double', 'border-width': 4 } },
+      { selector: 'node:selected', style: { 'overlay-color': '#4ea1ff', 'overlay-opacity': 0.25, 'overlay-padding': 6 } },
+      { selector: 'edge', style: {
+        width: 'data(w)', 'line-color': '#41505e', 'target-arrow-color': '#41505e', 'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier', label: 'data(label)', 'font-size': 8, color: '#8b98a5', 'text-rotation': 'autorotate',
+        'text-background-color': '#0f1419', 'text-background-opacity': 0.8, 'text-background-padding': 2
+      } },
+      { selector: 'edge.hot', style: { 'line-color': '#ff9f43', 'target-arrow-color': '#ff9f43' } },
+      { selector: 'edge:selected', style: { 'line-color': '#4ea1ff', 'target-arrow-color': '#4ea1ff' } }
+    ]
+  });
+  cy.on('tap', 'node', ev => showNode(nodes.get(ev.target.id())));
+  cy.on('tap', 'edge', ev => showEdge(edges.get(ev.target.id())));
+  cy.on('tap', ev => { if (ev.target === cy) hideDetail(); });
+}
+
+function scheduleRender() {
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(() => render(false), 350);
+}
+
+function render(final) {
+  if (!cy) initCy();
+  $('#empty').hidden = nodes.size > 0;
+  const maxUsd = Math.max(1, ...[...edges.values()].map(e => e.usd || Object.values(e.assets)[0] || 0));
+  cy.batch(() => {
+    for (const n of nodes.values()) {
+      const cls = nodeClass(n);
+      const label = labelOf(n);
+      const data = {
+        id: n.key, label: label ? `${label}\n${short(n.addr)}` : short(n.addr), color: COLORS[cls],
+        size: n.seed ? 44 : isEndpoint(n) ? 34 : 26, seed: !!n.seed, flagged: n.flags.some(f => f.level === 'high')
+      };
+      const el = cy.getElementById(n.key);
+      if (el.nonempty()) el.data(data);
+      else {
+        const parent = n.parent && cy.getElementById(n.parent);
+        const p = parent?.nonempty() ? parent.position() : { x: 0, y: 0 };
+        cy.add({ group: 'nodes', data, position: { x: p.x + (Math.random() - 0.5) * 120, y: p.y + (Math.random() - 0.5) * 120 } });
+      }
+    }
+    for (const e of edges.values()) {
+      if (!nodes.has(e.source) || !nodes.has(e.target)) continue;
+      const v = e.usd || Object.values(e.assets)[0] || 0;
+      const data = { id: e.key, source: e.source, target: e.target, label: edgeLabel(e), w: 1 + 6 * Math.sqrt(v / maxUsd) };
+      const el = cy.getElementById(e.key);
+      if (el.nonempty()) el.data(data); else cy.add({ group: 'edges', data });
+      const tgt = nodes.get(e.target);
+      cy.getElementById(e.key).toggleClass('hot', ['perp', 'suspect', 'sanction'].includes(nodeClass(tgt)));
+    }
+    cy.nodes().forEach(el => { if (!nodes.has(el.id())) el.remove(); });
+  });
+  runLayout(final);
+  renderFindings();
+  $('#btnExportPng').disabled = $('#btnExportJson').disabled = nodes.size === 0;
+}
+
+function runLayout(fit) {
+  if (!cy || cy.nodes().length === 0) return;
+  const opts = layoutName === 'flow'
+    ? { name: 'breadthfirst', directed: true, roots: current ? [current.seedKey] : undefined, spacingFactor: 1.2, animate: false }
+    : { name: 'cose', animate: false, randomize: !!fit, nodeRepulsion: () => 9000, idealEdgeLength: () => 110, gravity: 0.3, numIter: 600 };
+  cy.layout({ ...opts, fit: true, padding: 40 }).run();
+  if (fit) cy.fit(undefined, 40);
+}
+
+function renderFindings() {
+  const order = { high: 0, med: 1, info: 2 };
+  const pat = current ? window.PATTERNS[current.pattern] : null;
+  const list = [];
+  for (const n of nodes.values()) for (const f of n.flags) {
+    if (f.code === 'contract' || f.code === 'error') continue;
+    const focus = pat?.focus.includes(f.code) ? -0.5 : 0;
+    list.push({ n, f, score: order[f.level] + focus });
+  }
+  list.sort((a, b) => a.score - b.score);
+  $('#findCount').textContent = list.length;
+  $('#findings').innerHTML = list.slice(0, 80).map((x, i) =>
+    `<li class="${x.f.level}" data-i="${i}">${esc(x.f.text)}<small>${esc(labelOf(x.n) || '')} ${esc(x.n.addr)}</small></li>`).join('');
+  $('#findings').querySelectorAll('li').forEach(li => li.addEventListener('click', () => {
+    const n = list[+li.dataset.i].n;
+    focusNode(n.key);
+    showNode(n);
+  }));
+}
+
+function renderPlaybook() {
+  if (!current) return;
+  const pat = window.PATTERNS[current.pattern];
+  const exch = [...nodes.values()].filter(n => n.flags.some(f => f.code === 'exchange' || f.code === 'service'));
+  const steps = [...pat.steps];
+  if (exch.length) steps.splice(1, 0, `Gevonden cash-out-punten: ${exch.slice(0, 5).map(n => esc(labelOf(n) || short(n.addr))).join(', ')}.`);
+  $('#playbookList').innerHTML = steps.map(s => `<li>${s}</li>`).join('');
+  $('#playbook').hidden = false;
+}
+
+function focusNode(key) {
+  const el = cy?.getElementById(key);
+  if (!el || el.empty()) return;
+  cy.$(':selected').unselect();
+  el.select();
+  cy.animate({ center: { eles: el }, zoom: Math.max(cy.zoom(), 1) }, { duration: 300 });
+}
+
+// ---------- detailpaneel ----------
+function osintLinks(n) {
+  const a = encodeURIComponent(n.addr);
+  const q = encodeURIComponent(`"${n.addr}"`);
+  const ex = {
+    btc: [['mempool.space', `https://mempool.space/address/${a}`], ['Blockchair', `https://blockchair.com/bitcoin/address/${a}`], ['OXT', `https://oxt.me/address/${a}`]],
+    eth: [['Etherscan', `https://etherscan.io/address/${a}`], ['Blockscout', `https://eth.blockscout.com/address/${a}`]],
+    op: [['Optimism explorer', `https://explorer.optimism.io/address/${a}`], ['OP Etherscan', `https://optimistic.etherscan.io/address/${a}`]],
+    tron: [['Tronscan', `https://tronscan.org/#/address/${a}`]]
+  }[n.chain];
+  return [
+    ...ex,
+    ['Chainabuse', `https://www.chainabuse.com/address/${a}`],
+    ['Breadcrumbs', `https://www.breadcrumbs.app/reports/${a}`],
+    ['Arkham', `https://intel.arkm.com/explorer/address/${a}`],
+    ['Google', `https://www.google.com/search?q=${q}`],
+    ['X / Twitter', `https://x.com/search?q=${q}&f=live`],
+    ['Reddit', `https://www.reddit.com/search/?q=${q}`],
+    ['GitHub', `https://github.com/search?q=${q}&type=code`],
+    ['Telegram (Google)', `https://www.google.com/search?q=${encodeURIComponent('site:t.me "' + n.addr + '"')}`]
+  ];
+}
+
+function showNode(n) {
+  if (!n) return;
+  const m = metaStore[n.key] || {};
+  const label = labelOf(n);
+  const cls = nodeClass(n);
+  const roleTxt = { victim: 'Slachtoffer', perp: 'Dader', suspect: 'Verdacht', victim2: 'Mogelijk slachtoffer', exchange: 'Exchange / dienst', sanction: 'Sanctie / scamlijst', plain: 'Onbekend' }[cls];
+  const lower = n.addr.toLowerCase();
+  const related = [...edges.values()].filter(e => e.source === n.key || e.target === n.key)
+    .flatMap(e => e.txs.map(t => ({ ...t, dir: e.source === n.key ? 'out' : 'in', cp: nodes.get(e.source === n.key ? e.target : e.source) })))
+    .sort((a, b) => b.time - a.time).slice(0, 30);
+  $('#detailBody').innerHTML = `
+    <h3>${esc(label || short(n.addr))}</h3>
+    <div class="mono">${esc(n.addr)}</div>
+    <div class="tags"><span class="tag">${CHAIN_NAME[n.chain]}</span><span class="tag">${roleTxt}</span>
+      ${n.flags.map(f => `<span class="tag ${f.level}">${esc(f.text)}</span>`).join('')}</div>
+    <h4>OSINT (automatisch)</h4>
+    <dl class="kv">
+      <dt>OFAC-sanctie</dt><dd>${osint.ofac.has(n.addr) || osint.ofac.has(lower) ? '⚠️ JA' : 'nee'}</dd>
+      ${isEvm(n.chain) ? `<dt>ScamSniffer</dt><dd>${osint.scam?.has(lower) ? '⚠️ op blacklist' : osint.scam ? 'niet gevonden' : 'lijst niet geladen'}</dd>` : ''}
+      ${m.tags?.length ? `<dt>Publieke labels</dt><dd>${m.tags.map(esc).join(', ')}</dd>` : ''}
+      ${m.ens ? `<dt>ENS</dt><dd>${esc(m.ens)}</dd>` : ''}
+      ${m.name ? `<dt>Contractnaam</dt><dd>${esc(m.name)}</dd>` : ''}
+      ${window.KNOWN_LABELS[n.addr] ? `<dt>Bekend label</dt><dd>${esc(window.KNOWN_LABELS[n.addr].name)}</dd>` : ''}
+      ${n.data?.txCount ? `<dt>Transacties</dt><dd>${fmt(n.data.txCount)}</dd>` : ''}
+      ${n.data?.balance ? `<dt>Saldo</dt><dd>${esc(n.data.balance)}</dd>` : ''}
+      <dt>Hop</dt><dd>${n.depth ?? 0}${n.expanded ? '' : ' (nog niet opgehaald)'}</dd>
+    </dl>
+    <h4>OSINT-bronnen</h4>
+    <div class="links">${osintLinks(n).map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`).join('')}</div>
+    <div class="actions">
+      <button class="ghost" data-act="expand">Verder traceren</button>
+      <button class="ghost" data-act="copy">Kopieer adres</button>
+      <button class="ghost" data-act="perp">Markeer dader</button>
+      <button class="ghost" data-act="victim">Markeer slachtoffer</button>
+      <button class="ghost" data-act="label">Label toevoegen</button>
+      <button class="ghost" data-act="remove">Verwijder</button>
+    </div>
+    <h4>Transacties in het web</h4>
+    <div class="txlist">${related.map(t => `<div><span class="${t.dir}">${t.dir === 'out' ? '→' : '←'} ${esc(t.cp ? (labelOf(t.cp) || short(t.cp.addr)) : '?')}</span><span>${fmt(t.value)} ${esc(t.asset)}</span><span>${fmtTime(t.time)}</span></div>`).join('') || '<em>Nog geen transacties opgehaald.</em>'}</div>`;
+  $('#detailBody').querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => nodeAction(n, b.dataset.act)));
+  $('#detail').hidden = false;
+}
+
+function showEdge(e) {
+  if (!e) return;
+  const s = nodes.get(e.source), t = nodes.get(e.target);
+  const txUrl = id => ({ btc: `https://mempool.space/tx/${id}`, eth: `https://etherscan.io/tx/${id}`, op: `https://optimistic.etherscan.io/tx/${id}`, tron: `https://tronscan.org/#/transaction/${id}` }[s.chain]);
+  $('#detailBody').innerHTML = `
+    <h3>Geldstroom</h3>
+    <div class="mono">${esc(labelOf(s) || s.addr)}<br>→ ${esc(labelOf(t) || t.addr)}</div>
+    <dl class="kv" style="margin-top:10px">
+      <dt>Totaal</dt><dd>${esc(edgeLabel(e))}</dd>
+      ${e.usd ? `<dt>≈ USD</dt><dd>$${fmt(e.usd)}</dd>` : ''}
+      <dt>Eerste</dt><dd>${fmtTime(e.first)}</dd>
+      <dt>Laatste</dt><dd>${fmtTime(e.last)}</dd>
+    </dl>
+    <h4>Transacties</h4>
+    <div class="txlist">${e.txs.map(x => `<div><a href="${esc(txUrl(x.txid))}" target="_blank" rel="noopener noreferrer" class="mono">${esc(short(x.txid))}</a><span>${fmt(x.value)} ${esc(x.asset)}</span><span>${fmtTime(x.time)}</span></div>`).join('')}</div>`;
+  $('#detail').hidden = false;
+}
+
+function hideDetail() { $('#detail').hidden = true; }
+
+async function nodeAction(n, act) {
+  if (act === 'copy') { try { await navigator.clipboard.writeText(n.addr); setStatus('Adres gekopieerd.'); } catch { prompt('Kopieer:', n.addr); } return; }
+  if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); showNode(n); return; }
+  if (act === 'label') {
+    const v = prompt('Label voor dit adres (leeg = verwijderen):', customLabels[n.key] || '');
+    if (v === null) return;
+    if (v.trim()) customLabels[n.key] = v.trim(); else delete customLabels[n.key];
+    store.set('chaintrace.labels', customLabels);
+    n.flags = n.flags.filter(f => f.code !== 'exchange');
+    lightAnalyze(n);
+    render(false); showNode(n); return;
+  }
+  if (act === 'remove') {
+    if (n.seed) return;
+    nodes.delete(n.key);
+    for (const [k, e] of edges) if (e.source === n.key || e.target === n.key) edges.delete(k);
+    cy.getElementById(n.key).remove();
+    hideDetail(); render(false); return;
+  }
+  if (act === 'expand') {
+    if (!current) return;
+    stopped = false;
+    setBusy(true);
+    n.expanded = false;
+    const before = current.opts.maxNodes;
+    current.opts.maxNodes = Math.max(before, nodes.size + current.opts.fanout * 2);
+    await expand(n, n.depth || 0, 'both');
+    setBusy(false);
+    render(false);
+    setStatus(`${nodes.size} adressen, ${edges.size} geldstromen.`);
+    showNode(n);
+  }
+}
+
+// ---------- export / import ----------
+function saveFile(name, mime, dataUrlOrText, isDataUrl) {
+  if (window.AndroidBridge?.saveFile) {
+    const b64 = isDataUrl ? dataUrlOrText.split(',')[1] : btoa(unescape(encodeURIComponent(dataUrlOrText)));
+    window.AndroidBridge.saveFile(name, mime, b64);
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = isDataUrl ? dataUrlOrText : URL.createObjectURL(new Blob([dataUrlOrText], { type: mime }));
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+const stamp = () => new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+
+function exportJson() {
+  const seed = nodes.get(current?.seedKey);
+  const dossier = {
+    tool: 'ChainTrace', version: 1, exported: new Date().toISOString(),
+    case: current && { chain: current.chain, role: current.role, pattern: window.PATTERNS[current.pattern].name, patternKey: current.pattern, seed: seed?.addr, started: current.started },
+    nodes: [...nodes.values()].map(n => ({ key: n.key, chain: n.chain, address: n.addr, label: labelOf(n), role: n.role, classification: nodeClass(n), hop: n.depth, flags: n.flags, seed: !!n.seed, hint: n.hint, parent: n.parent })),
+    edges: [...edges.values()].map(e => ({ ...e, first: e.first === Infinity ? null : e.first })),
+    customLabels
+  };
+  saveFile(`chaintrace-${short(seed?.addr || 'dossier').replace('…', '_')}-${stamp()}.json`, 'application/json', JSON.stringify(dossier, null, 2), false);
+}
+
+function exportPng() {
+  if (!cy) return;
+  saveFile(`chaintrace-${stamp()}.png`, 'image/png', cy.png({ full: true, scale: 2, bg: '#0f1419' }), true);
+}
+
+function importJson(text) {
+  const d = JSON.parse(text);
+  if (d.tool !== 'ChainTrace') throw new Error('Geen ChainTrace-dossier');
+  abortCtl.abort(); abortCtl = new AbortController();
+  resetGraph();
+  current = { chain: d.case?.chain || d.nodes[0]?.chain, role: d.case?.role || 'victim', pattern: d.case?.patternKey || 'generic',
+    seedKey: d.nodes.find(n => n.seed)?.key, started: d.case?.started, opts: readOpts() };
+  Object.assign(customLabels, d.customLabels || {});
+  for (const x of d.nodes) {
+    const n = getNode(x.chain, x.address);
+    Object.assign(n, { role: x.role, flags: x.flags || [], seed: x.seed, depth: x.hop, hint: x.hint, parent: x.parent, expanded: true });
+  }
+  for (const e of d.edges) edges.set(e.key, { ...e, first: e.first ?? Infinity });
+  render(true);
+  renderPlaybook();
+  setStatus(`Dossier geladen: ${nodes.size} adressen.`);
+}
+
+// ---------- UI ----------
+function resetGraph() {
+  nodes.clear(); edges.clear();
+  if (cy) cy.elements().remove();
+  hideDetail();
+  $('#playbook').hidden = true;
+}
+
+function setStatus(t, err = false) { const s = $('#status'); s.textContent = t; s.classList.toggle('err', err); }
+function setBusy(b) { $('#btnTrace').disabled = b; $('#btnStop').hidden = !b; }
+
+function readOpts() {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
+  return { depth: clamp($('#depth').value, 1, 4), fanout: clamp($('#fanout').value, 2, 25), maxNodes: clamp($('#maxNodes').value, 10, 300) };
+}
+
+function updateChainHint() {
+  const a = $('#addr').value.trim();
+  const sel = $('#chain').value;
+  const det = detectChain(a);
+  $('#chainHint').textContent = !a ? 'Keten wordt automatisch herkend'
+    : det ? `Herkend: ${CHAIN_NAME[det]}${det === 'eth' ? ' (kies Optimism voor die keten)' : ''}` + (sel !== 'auto' ? ` · gekozen: ${CHAIN_NAME[sel]}` : '')
+    : 'Onbekend adresformaat';
+}
+
+function applyPatternDefaults() {
+  const p = window.PATTERNS[$('#pattern').value];
+  $('#patternInfo').textContent = p.info;
+  $('#depth').value = p.depth;
+  $('#fanout').value = p.fanout;
+}
+
+function setup() {
+  $('#pattern').innerHTML = Object.entries(window.PATTERNS).map(([k, p]) => `<option value="${k}">${esc(p.name)}</option>`).join('');
+  applyPatternDefaults();
+  $('#pattern').addEventListener('change', applyPatternDefaults);
+  $('#addr').addEventListener('input', updateChainHint);
+  $('#chain').addEventListener('change', updateChainHint);
+
+  $('#traceForm').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const addr = $('#addr').value.trim();
+    const det = detectChain(addr);
+    let chain = $('#chain').value;
+    if (chain === 'auto') chain = det;
+    if (!chain) { setStatus('Onbekend adresformaat. Kies handmatig een keten.', true); return; }
+    if (det && (isEvm(det) !== isEvm(chain) || (!isEvm(det) && det !== chain))) { setStatus(`Adres past niet bij ${CHAIN_NAME[chain]}.`, true); return; }
+    const role = document.querySelector('input[name=role]:checked').value;
+    const pattern = $('#pattern').value;
+    try { history.replaceState(null, '', `?addr=${encodeURIComponent(addr)}&chain=${chain}&role=${role}&pattern=${pattern}`); } catch { /* file:// */ }
+    runTrace(addr, chain, role, pattern, readOpts()).catch(err => {
+      setBusy(false);
+      if (err.name !== 'AbortError') setStatus('Fout: ' + err.message, true);
+    });
+  });
+  $('#btnStop').addEventListener('click', () => { stopped = true; abortCtl.abort(); setBusy(false); setStatus('Gestopt.'); render(true); });
+  $('#detailClose').addEventListener('click', hideDetail);
+  $('#btnExportJson').addEventListener('click', exportJson);
+  $('#btnExportPng').addEventListener('click', exportPng);
+  $('#fileImport').addEventListener('change', async ev => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    try { importJson(await f.text()); } catch (err) { setStatus('Import mislukt: ' + err.message, true); }
+    ev.target.value = '';
+  });
+  const setLayout = name => {
+    layoutName = name;
+    $('#btnLayoutWeb').classList.toggle('active', name === 'web');
+    $('#btnLayoutFlow').classList.toggle('active', name === 'flow');
+    runLayout(true);
+  };
+  $('#btnLayoutWeb').addEventListener('click', () => setLayout('web'));
+  $('#btnLayoutFlow').addEventListener('click', () => setLayout('flow'));
+  $('#btnFit').addEventListener('click', () => cy?.fit(undefined, 40));
+
+  const q = new URLSearchParams(location.search);
+  if (q.get('addr')) {
+    $('#addr').value = q.get('addr');
+    if (q.get('chain')) $('#chain').value = q.get('chain');
+    if (q.get('pattern') && window.PATTERNS[q.get('pattern')]) { $('#pattern').value = q.get('pattern'); applyPatternDefaults(); }
+    if (q.get('role') === 'perp') $('#rolePerp').checked = true;
+    updateChainHint();
+  }
+}
+
+setup();
+// Testhaak voor automatische checks (bijv. via adb/DevTools).
+window.ChainTrace = { runTrace, nodes, edges, detectChain };
+})();
