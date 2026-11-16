@@ -22,6 +22,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.webkit.WebViewAssetLoader
+import nl.chaintrace.app.osint.OsintDb
+import nl.chaintrace.app.osint.OsintSyncWorker
 import java.io.File
 
 /**
@@ -87,6 +89,9 @@ class MainActivity : ComponentActivity() {
             }
         })
 
+        // De eerste periodieke run start direct; daarna elke 24 uur.
+        OsintSyncWorker.scheduleDaily(this)
+
         if (savedInstanceState != null) webView.restoreState(savedInstanceState)
         else webView.loadUrl("https://$APP_HOST/assets/index.html")
     }
@@ -97,6 +102,32 @@ class MainActivity : ComponentActivity() {
     }
 
     private inner class Bridge {
+        private val db get() = OsintDb.get(this@MainActivity)
+
+        /** Labels uit de lokale OSINT-database + eigen eerdere waarnemingen (andere zaken). */
+        @JavascriptInterface
+        fun osintLookup(address: String, currentCase: String?): String =
+            runCatching { db.lookup(address, currentCase).toString() }.getOrElse { "{\"labels\":[],\"observations\":[]}" }
+
+        @JavascriptInterface
+        fun osintSearch(query: String): String = runCatching { db.search(query).toString() }.getOrElse { "[]" }
+
+        @JavascriptInterface
+        fun osintStats(): String = db.stats(getDatabasePath("osint.db").length()).toString()
+
+        @JavascriptInterface
+        fun osintSyncNow() = OsintSyncWorker.runNow(this@MainActivity)
+
+        @JavascriptInterface
+        fun recordObservations(json: String) {
+            runCatching { db.recordObservations(json) }.onFailure { Log.e(TAG, "recordObservations", it) }
+        }
+
+        @JavascriptInterface
+        fun saveUserLabel(chain: String, address: String, label: String) {
+            runCatching { db.setUserLabel(chain, address, label) }.onFailure { Log.e(TAG, "saveUserLabel", it) }
+        }
+
         @JavascriptInterface
         fun saveFile(name: String, mime: String, base64: String) {
             val safeName = name.replace(Regex("[^A-Za-z0-9._-]"), "_")

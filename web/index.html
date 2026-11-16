@@ -16,6 +16,7 @@
     </div>
   </div>
   <div class="top-actions">
+    <button id="btnDb" class="ghost" hidden>Database</button>
     <button id="btnExportPng" class="ghost" disabled>PNG</button>
     <button id="btnExportJson" class="ghost" disabled>Dossier</button>
     <label class="ghost filebtn">Importeer<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
@@ -106,6 +107,18 @@
     <div id="detailBody"></div>
   </aside>
 </main>
+
+<dialog id="dbDialog" class="dlg">
+  <div class="dlg-head">
+    <h2>Lokale OSINT-database</h2>
+    <button class="close" id="btnDbClose" type="button" aria-label="Sluiten">×</button>
+  </div>
+  <p id="dbSummary" class="small"></p>
+  <input id="dbSearch" type="text" spellcheck="false" placeholder="Zoek adres of label (bv. Binance, Lazarus, LockBit)…">
+  <ul id="dbResults" class="dbresults"></ul>
+  <table class="srctable"><thead><tr><th>Bron</th><th class="num">Records</th><th>Status</th><th>Bijgewerkt</th></tr></thead><tbody id="dbSources"></tbody></table>
+  <button id="btnDbSync" class="primary" type="button">Nu bijwerken</button>
+</dialog>
 
 <footer class="foot">
   Data: mempool.space · Blockscout · TronGrid · OFAC-lijst (0xB10C) · ScamSniffer. Heuristieken zijn aanwijzingen, geen bewijs.

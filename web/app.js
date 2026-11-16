@@ -43,6 +43,34 @@ const store = {
 };
 let customLabels = store.get('chaintrace.labels', {});
 
+// ---------- lokale OSINT-database (alleen in de Android-app) ----------
+const LOCAL_DB = !!window.AndroidBridge?.osintLookup;
+const dbCache = new Map();
+function dbStats() {
+  try { return JSON.parse(window.AndroidBridge.osintStats()); } catch { return null; }
+}
+function dbLookup(n) {
+  if (!LOCAL_DB) return null;
+  if (!dbCache.has(n.key)) {
+    let r = null;
+    try { r = JSON.parse(window.AndroidBridge.osintLookup(n.addr, nodes.get(current?.seedKey)?.addr || '')); } catch { /* bridge niet beschikbaar */ }
+    dbCache.set(n.key, r);
+  }
+  return dbCache.get(n.key);
+}
+function recordObservations() {
+  if (!LOCAL_DB || !current) return;
+  const seed = nodes.get(current.seedKey);
+  if (!seed) return;
+  try {
+    window.AndroidBridge.recordObservations(JSON.stringify({
+      seed: seed.addr, pattern: current.pattern,
+      nodes: [...nodes.values()].map(n => ({ address: n.addr, chain: n.chain, role: n.role, classification: nodeClass(n), flags: n.flags.map(f => f.code), label: labelOf(n) }))
+    }));
+  } catch { /* niet fataal */ }
+}
+const CAT_NL = { sanction: 'sanctie', scam: 'scam', phishing: 'phishing', exploit: 'exploit/hack', ransomware: 'ransomware', frozen: 'bevroren', exchange: 'exchange', mixer: 'mixer', darknet: 'darknet', bridge: 'bridge', label: 'label', user: 'eigen label' };
+
 // ---------- HTTP met wachtrij, cache en retry ----------
 const MAX_PAR = 3;
 let running = 0;
@@ -76,6 +104,8 @@ function getData(url, asText = false) {
 // ---------- OSINT-lijsten ----------
 const osint = { ofac: new Set(), ofacLoaded: new Set(), scam: null };
 async function loadLists(chain) {
+  // In de app staan deze lijsten (en meer) al in de lokale database.
+  if (LOCAL_DB && (dbStats()?.labels || 0) > 0) return;
   await Promise.all(OFAC_LISTS[chain].map(async sym => {
     if (osint.ofacLoaded.has(sym)) return;
     const txt = await getData(`https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_${sym}.txt`, true).catch(() => null);
@@ -234,6 +264,9 @@ function labelOf(n) {
   if (known) return known.name;
   const m = metaStore[n.key];
   if (m?.tags?.length) return m.tags[0];
+  const db = dbLookup(n);
+  const dl = db?.labels.find(l => l.category === 'user') || db?.labels.find(l => !['sanction', 'frozen', 'label'].includes(l.category)) || db?.labels.find(l => l.category === 'label');
+  if (dl) return dl.label;
   if (m?.ens) return m.ens;
   if (m?.name) return m.name;
   return null;
@@ -258,6 +291,25 @@ function lightAnalyze(n) {
   if (known?.type === 'exchange' || EXCHANGE_RE.test(text)) addFlag(n, 'exchange', 'info', 'Exchange — cash-out-punt, bevriezing/informatieverzoek mogelijk');
   if (BRIDGE_RE.test(text)) addFlag(n, 'bridge', 'med', 'Bridge — geld gaat naar een andere keten');
   if (m?.contract || known?.type === 'contract') addFlag(n, 'contract', 'info', 'Smart contract');
+  const db = dbLookup(n);
+  if (!db) return;
+  const src = l => `${l.label} — bron: ${l.source}`;
+  for (const l of db.labels) {
+    switch (l.category) {
+      case 'sanction': addFlag(n, 'sanction', 'high', 'OFAC-sanctielijst (lokale DB)'); break;
+      case 'scam': case 'phishing': case 'exploit': addFlag(n, 'scamlist', 'high', src(l)); break;
+      case 'ransomware': addFlag(n, 'ransomware', 'high', src(l)); break;
+      case 'frozen': addFlag(n, 'frozen', 'high', `Door Tether bevroren${l.detail ? ' — ' + l.detail : ''} (USDT-blacklist)`); break;
+      case 'mixer': addFlag(n, 'mixer', 'high', src(l)); break;
+      case 'darknet': addFlag(n, 'darknet', 'high', src(l)); break;
+      case 'exchange': addFlag(n, 'exchange', 'info', `Exchange: ${l.label} — cash-out-punt`); break;
+      case 'bridge': addFlag(n, 'bridge', 'med', `Bridge: ${l.label}`); break;
+    }
+  }
+  const obs = db.observations || [];
+  const asPerp = obs.find(o => o.role === 'perp' || ['perp', 'sanction'].includes(o.classification));
+  if (asPerp) addFlag(n, 'seenbefore', 'high', `Eerder als dader/verdacht gezien in zaak ${short(asPerp.caseSeed)} (${new Date(asPerp.seen).toLocaleDateString('nl-NL')})`);
+  else if (obs.length) addFlag(n, 'seenbefore', 'med', `Al eerder gezien in ${obs.length} andere zaak/zaken`);
 }
 
 function fullAnalyze(n) {
@@ -405,6 +457,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   stopped = false;
   resetGraph();
   current = { chain, role, pattern, opts, seedKey: keyOf(chain, addr), started: new Date().toISOString() };
+  dbCache.clear();
   setBusy(true);
   setStatus('OSINT-lijsten laden (OFAC, ScamSniffer)…');
   await loadLists(chain);
@@ -421,6 +474,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   setBusy(false);
   render(true);
   renderPlaybook();
+  if (!stopped) recordObservations();
   setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen.`);
 }
 
@@ -433,7 +487,8 @@ const COLORS = { victim: '#3fa7ff', victim2: '#8cc8ff', perp: '#ff4d5e', suspect
 
 function nodeClass(n) {
   if (n.role) return n.role;
-  if (n.flags.some(f => ['sanction', 'scamlist', 'mixer', 'badtag'].includes(f.code))) return 'sanction';
+  if (n.flags.some(f => ['sanction', 'scamlist', 'mixer', 'badtag', 'ransomware', 'frozen', 'darknet'].includes(f.code))) return 'sanction';
+  if (n.flags.some(f => f.code === 'seenbefore' && f.level === 'high')) return 'suspect';
   if (n.flags.some(f => f.code === 'lookalike' && f.level === 'high')) return 'perp';
   if (n.flags.some(f => ['exchange', 'service'].includes(f.code))) return 'exchange';
   if (n.hint === 'suspect' || n.flags.some(f => ['passthrough', 'fanin', 'peel', 'lookalike'].includes(f.code))) return 'suspect';
@@ -611,6 +666,7 @@ function showNode(n) {
       ${n.data?.balance ? `<dt>Saldo</dt><dd>${esc(n.data.balance)}</dd>` : ''}
       <dt>Hop</dt><dd>${n.depth ?? 0}${n.expanded ? '' : ' (nog niet opgehaald)'}</dd>
     </dl>
+    ${dbSection(n)}
     <h4>OSINT-bronnen</h4>
     <div class="links">${osintLinks(n).map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`).join('')}</div>
     <div class="actions">
@@ -625,6 +681,15 @@ function showNode(n) {
     <div class="txlist">${related.map(t => `<div><span class="${t.dir}">${t.dir === 'out' ? '→' : '←'} ${esc(t.cp ? (labelOf(t.cp) || short(t.cp.addr)) : '?')}</span><span>${fmt(t.value)} ${esc(t.asset)}</span><span>${fmtTime(t.time)}</span></div>`).join('') || '<em>Nog geen transacties opgehaald.</em>'}</div>`;
   $('#detailBody').querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => nodeAction(n, b.dataset.act)));
   $('#detail').hidden = false;
+}
+
+function dbSection(n) {
+  if (!LOCAL_DB) return '';
+  const db = dbLookup(n);
+  const labels = db?.labels || [], obs = db?.observations || [];
+  return `<h4>Lokale OSINT-database</h4>
+    ${labels.length ? `<dl class="kv">${labels.map(l => `<dt>${esc(CAT_NL[l.category] || l.category)}</dt><dd>${esc(l.label)}<br><small class="muted">${esc(l.source)}${l.detail ? ' · ' + esc(l.detail) : ''}</small></dd>`).join('')}</dl>` : '<div class="muted small">Geen labels in de lokale database.</div>'}
+    ${obs.length ? `<div class="small" style="margin-top:6px">Eerder gezien in: ${obs.map(o => `${esc(short(o.caseSeed))} (${esc(o.role || o.classification || '?')}, ${new Date(o.seen).toLocaleDateString('nl-NL')})`).join(', ')}</div>` : ''}`;
 }
 
 function showEdge(e) {
@@ -649,12 +714,13 @@ function hideDetail() { $('#detail').hidden = true; }
 
 async function nodeAction(n, act) {
   if (act === 'copy') { try { await navigator.clipboard.writeText(n.addr); setStatus('Adres gekopieerd.'); } catch { prompt('Kopieer:', n.addr); } return; }
-  if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); showNode(n); return; }
+  if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); showNode(n); recordObservations(); return; }
   if (act === 'label') {
     const v = prompt('Label voor dit adres (leeg = verwijderen):', customLabels[n.key] || '');
     if (v === null) return;
     if (v.trim()) customLabels[n.key] = v.trim(); else delete customLabels[n.key];
     store.set('chaintrace.labels', customLabels);
+    if (LOCAL_DB) { try { window.AndroidBridge.saveUserLabel(n.chain, n.addr, v.trim()); } catch { /* niet fataal */ } dbCache.delete(n.key); }
     n.flags = n.flags.filter(f => f.code !== 'exchange');
     lightAnalyze(n);
     render(false); showNode(n); return;
@@ -806,6 +872,8 @@ function setup() {
   $('#btnLayoutFlow').addEventListener('click', () => setLayout('flow'));
   $('#btnFit').addEventListener('click', () => cy?.fit(undefined, 40));
 
+  setupDbDialog();
+
   const q = new URLSearchParams(location.search);
   if (q.get('addr')) {
     $('#addr').value = q.get('addr');
@@ -814,6 +882,51 @@ function setup() {
     if (q.get('role') === 'perp') $('#rolePerp').checked = true;
     updateChainHint();
   }
+}
+
+// ---------- databasescherm ----------
+let dbPoll = null;
+function renderDbStats() {
+  const s = dbStats();
+  if (!s) return;
+  const mb = (s.bytes / 1048576).toFixed(1);
+  $('#dbSummary').innerHTML = `<b>${fmt(s.addresses)}</b> adressen met <b>${fmt(s.labels)}</b> labels · ${mb} MB<br>
+    Eigen waarnemingen: ${fmt(s.observedAddresses)} adressen in ${fmt(s.cases)} zaken<br>
+    Laatste update: ${s.lastRun ? new Date(s.lastRun).toLocaleString('nl-NL') : 'nog nooit'}${s.running ? ' · <b>bijwerken…</b>' : ''} · daarna dagelijks automatisch`;
+  $('#dbSources').innerHTML = s.sources.map(x => `<tr><td><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name)}</a></td>
+    <td class="num">${fmt(x.count)}</td><td class="st ${esc(x.status)}" title="${esc(x.error || '')}">${esc(x.status)}${x.error ? ' ⚠' : ''}</td>
+    <td>${x.lastSync ? new Date(x.lastSync).toLocaleDateString('nl-NL') : '—'}</td></tr>`).join('');
+  $('#btnDbSync').disabled = s.running;
+}
+function setupDbDialog() {
+  if (!LOCAL_DB) return;
+  $('#btnDb').hidden = false;
+  const dlg = $('#dbDialog');
+  $('#btnDb').addEventListener('click', () => {
+    renderDbStats();
+    dlg.showModal();
+    clearInterval(dbPoll);
+    dbPoll = setInterval(renderDbStats, 2000);
+  });
+  dlg.addEventListener('close', () => clearInterval(dbPoll));
+  $('#btnDbClose').addEventListener('click', () => dlg.close());
+  $('#btnDbSync').addEventListener('click', () => { window.AndroidBridge.osintSyncNow(); setTimeout(renderDbStats, 800); });
+  let t = null;
+  $('#dbSearch').addEventListener('input', ev => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      let rows = [];
+      try { rows = JSON.parse(window.AndroidBridge.osintSearch(ev.target.value)); } catch { /* leeg */ }
+      $('#dbResults').innerHTML = rows.map((r, i) => `<li data-i="${i}"><span class="tag">${esc(CAT_NL[r.category] || r.category)}</span> ${esc(r.label)}<small>${esc(r.address)} · ${esc(r.source)}</small></li>`).join('')
+        || (ev.target.value.trim().length >= 3 ? '<li class="muted">Niets gevonden.</li>' : '');
+      $('#dbResults').querySelectorAll('li[data-i]').forEach(li => li.addEventListener('click', () => {
+        $('#addr').value = rows[+li.dataset.i].address;
+        $('#chain').value = 'auto';
+        updateChainHint();
+        dlg.close();
+      }));
+    }, 250);
+  });
 }
 
 setup();
