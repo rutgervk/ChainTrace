@@ -1,9 +1,16 @@
 package nl.chaintrace.app.osint
 
+import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 private const val TETHER_LABEL = "Door Tether bevroren (USDT-blacklist)"
+private const val USDT_ETH = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+// Gratis RPC zonder sleutel; levert logs voor recente blokken (geen archief), genoeg voor de dagelijkse aanvulling.
+private const val RPC = "https://ethereum-rpc.publicnode.com"
 
 /**
  * Tether (USDT) blacklist op Tron via TronGrid-events. AddedBlackList én RemovedBlackList worden
@@ -57,10 +64,70 @@ class TetherEthSource : OsintSource("tether_eth", "Tether-bevriezingen (Ethereum
     private fun fetch(db: OsintDb, tmp: File) {
         for ((topic, added) in topics) {
             val key = "tether_eth_block_" + topic.take(10)
+            try {
+                fetchBlockscout(db, tmp, topic, added, key)
+            } catch (e: Exception) {
+                // De volledige historie kan alleen via Blockscout; dagelijkse aanvulling kan ook via publieke RPC.
+                if ((db.getKv(key)?.toLongOrNull() ?: 0L) == 0L) throw e
+                Log.w("ChainTraceOsint", "tether_eth: Blockscout faalt (${e.message}), fallback naar RPC")
+                fetchRpc(db, topic, added, key)
+            }
+        }
+    }
+
+    private fun fetchRpc(db: OsintDb, topic: String, added: Boolean, key: String) {
+        val latest = java.lang.Long.decode(rpc("eth_blockNumber", JSONArray()).toString())
+        var from = db.getKv(key)!!.toLong() + 1
+        var chunks = 0
+        while (from <= latest && chunks++ < 60) {
+            val to = minOf(from + 4_999, latest)
+            val filter = JSONObject().put("fromBlock", "0x" + from.toString(16)).put("toBlock", "0x" + to.toString(16))
+                .put("address", USDT_ETH).put("topics", JSONArray().put(topic))
+            val logs = rpc("eth_getLogs", JSONArray().put(filter)) as JSONArray
+            val events = ArrayList<FreezeEvent>()
+            for (i in 0 until logs.length()) {
+                val l = logs.getJSONObject(i)
+                val data = l.getString("data")
+                if (data.length < 42) continue
+                val block = java.lang.Long.decode(l.getString("blockNumber"))
+                // blockTimestamp is niet overal aanwezig; anders schatten met ~12 s per blok.
+                val ts = l.optString("blockTimestamp").takeIf { it.startsWith("0x") }?.let { java.lang.Long.decode(it) * 1000 }
+                    ?: (System.currentTimeMillis() - (latest - block) * 12_000)
+                events.add(FreezeEvent("0x" + data.takeLast(40), ts, added))
+            }
+            db.recordFreezes("evm", events)
+            db.setKv(key, to.toString())
+            from = to + 1
+            Thread.sleep(300)
+        }
+    }
+
+    private fun rpc(method: String, params: JSONArray): Any {
+        val body = JSONObject().put("jsonrpc", "2.0").put("id", 1).put("method", method).put("params", params).toString()
+        val c = URL(RPC).openConnection() as HttpURLConnection
+        try {
+            c.connectTimeout = 20_000
+            c.readTimeout = 60_000
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.setRequestProperty("User-Agent", "ChainTrace/1.0 (open-source OSINT)")
+            c.outputStream.use { it.write(body.toByteArray()) }
+            if (c.responseCode != 200) throw RuntimeException("RPC HTTP ${c.responseCode}")
+            val o = JSONObject(c.inputStream.bufferedReader().readText())
+            o.optJSONObject("error")?.let { throw RuntimeException("RPC: ${it.optString("message")}") }
+            return o.get("result")
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    private fun fetchBlockscout(db: OsintDb, tmp: File, topic: String, added: Boolean, key: String) {
+        run {
             var from = db.getKv(key)?.toLongOrNull() ?: 0L
             for (page in 0 until 60) {
                 val url = "https://eth.blockscout.com/api?module=logs&action=getLogs&fromBlock=$from&toBlock=latest" +
-                    "&address=0xdac17f958d2ee523a2206206994597c13d831ec7&topic0=$topic"
+                    "&address=$USDT_ETH&topic0=$topic"
                 val res = JSONObject(getJson(url, tmp)).optJSONArray("result") ?: break
                 val events = ArrayList<FreezeEvent>()
                 var maxBlock = from
