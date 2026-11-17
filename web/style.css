@@ -167,3 +167,37 @@ textarea.note:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .detail-panel { position: fixed; top: auto; left: 0; width: 100%; height: 65vh; border-left: 0; border-top: 1px solid var(--line); }
   .sub { display: none; }
 }
+
+/* ---- eenvoudiger UI ---- */
+.ghost.accent { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.menu { position: relative; }
+.menu > summary { list-style: none; display: inline-block; }
+.menu > summary::-webkit-details-marker { display: none; }
+.menu-items {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; min-width: 190px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 6px; box-shadow: 0 10px 30px rgba(0,0,0,.45); display: flex; flex-direction: column; gap: 2px;
+}
+.menu-items button, .menu-items label { text-align: left; padding: 9px 10px; border: 0; background: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.menu-items button:disabled { opacity: .4; cursor: default; }
+.menu-items button:not(:disabled):hover, .menu-items label:hover { background: var(--panel-2); }
+.addr-row { display: flex; gap: 6px; }
+.addr-row input { flex: 1; min-width: 0; }
+.opt { font-style: normal; text-transform: none; letter-spacing: 0; opacity: .8; }
+.adv .row select { width: 130px; }
+.summary { margin-top: 16px; padding: 12px; border: 1px solid var(--accent); border-radius: var(--radius); background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.summary h2 { margin: 0 0 8px; font-size: 14px; }
+.summary ul { margin: 0 0 12px; padding-left: 18px; font-size: 13px; }
+.summary li { margin-bottom: 6px; }
+.summary li.warn { color: #ff8a95; }
+.summary li.good { color: var(--exchange); }
+.sec { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.sec > summary { cursor: pointer; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.sec > summary .badge { margin-left: auto; }
+.sec[open] > summary { margin-bottom: 8px; }
+.steps { max-width: 460px; text-align: left; background: color-mix(in srgb, var(--panel) 80%, transparent); padding: 20px 24px; border-radius: var(--radius); border: 1px solid var(--line); }
+.steps h2 { margin: 0 0 10px; font-size: 17px; color: var(--text); }
+.steps ol { padding-left: 20px; margin: 0 0 10px; }
+.steps li { margin-bottom: 8px; }
+.steps p { margin: 0; font-size: 12px; }
+.dot.victim2 { background: #8cc8ff; }
+.hint.bad { color: var(--perp); }

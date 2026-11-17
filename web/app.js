@@ -501,8 +501,9 @@ async function runTrace(addr, chain, role, pattern, opts) {
   setBusy(false);
   render(true);
   renderPlaybook();
+  renderSummary();
   if (!stopped) recordObservations();
-  setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen.`);
+  setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen. Tik op een adres voor details.`);
 }
 
 // ---------- herkomst: startwallets en instroom via exchanges ----------
@@ -606,6 +607,7 @@ function renderOrigins() {
   const starts = [...origins.starts.values()].sort((a, b) => (b.usd - a.usd) || ((a.first || 0) - (b.first || 0)));
   const cash = [...origins.cashIn].sort((a, b) => (a.time || 0) - (b.time || 0));
   $('#origins').hidden = !origins.rootKey;
+  $('#originCount').textContent = starts.length + cash.length;
   $('#startCount').textContent = starts.length;
   $('#cashCount').textContent = cash.length;
   $('#startList').innerHTML = starts.map((r, i) => {
@@ -752,7 +754,8 @@ function render(final) {
   });
   runLayout(final);
   renderFindings();
-  $('#btnExportPng').disabled = $('#btnExportJson').disabled = nodes.size === 0;
+  $('#btnExportPng').disabled = $('#btnExportJson').disabled = $('#btnPdf').disabled = nodes.size === 0;
+  $('#findingsBox').hidden = nodes.size === 0;
   renderOrigins();
 }
 
@@ -939,6 +942,7 @@ async function nodeAction(n, act) {
     await traceOrigins(n, { depth: 3, fanIn: Math.max(4, current.opts.fanout) });
     setBusy(false);
     render(true);
+    renderSummary();
     setStatus(`Herkomst: ${origins.starts.size} startwallets, ${origins.cashIn.length} instroom-transacties.`);
     showNode(n);
     return;
@@ -1174,6 +1178,205 @@ async function exportReport(kind) {
   $('#exportDialog').close();
 }
 
+// ---------- samenvatting in gewone taal ----------
+const BAD_CODES = ['sanction', 'scamlist', 'ransomware', 'frozen', 'mixer', 'darknet', 'badtag'];
+const CLASS_NL = { victim: 'Slachtoffer', perp: 'Dader', suspect: 'Verdacht', victim2: 'Mogelijk slachtoffer', exchange: 'Exchange / dienst', sanction: 'Waarschuwingslijst', plain: 'Onbekend' };
+const nameList = arr => [...new Set(arr)].slice(0, 4).join(', ') + (new Set(arr).size > 4 ? ' e.a.' : '');
+
+function summaryLines() {
+  const seed = nodes.get(current?.seedKey);
+  if (!seed) return [];
+  const all = [...nodes.values()];
+  const out = [];
+  const down = all.filter(n => !n.upstream && !n.seed);
+  out.push({ text: `Vanaf het adres van ${current.role === 'perp' ? 'de dader' : 'het slachtoffer'} is het geld gevolgd langs ${down.length} adressen.` });
+  const exch = down.filter(n => n.flags.some(f => f.code === 'exchange' || f.code === 'service'));
+  if (exch.length) {
+    out.push({ cls: 'good', text: `Het geld komt uit bij ${exch.length} exchange(s) of dienst(en): ${nameList(exch.map(n => labelOf(n) || 'onbekende dienst ' + short(n.addr)))}. Daar kan de politie opvragen wie de rekeninghouder is en om bevriezing vragen.` });
+  } else {
+    out.push({ text: 'Er is nog geen exchange gevonden waar het geld uitkomt. Tik op een oranje adres en kies "Verder traceren" om dieper te zoeken.' });
+  }
+  const bad = all.filter(n => n.flags.some(f => BAD_CODES.includes(f.code)));
+  if (bad.length) out.push({ cls: 'warn', text: `${bad.length} adres(sen) staan op een waarschuwingslijst (sanctie, scam, ransomware, mixer of door Tether bevroren).` });
+  const look = all.filter(n => n.flags.some(f => f.code === 'lookalike' && f.level === 'high'));
+  if (look.length) out.push({ cls: 'warn', text: `${look.length} adres(sen) lijken sterk op een ander adres: mogelijk "address poisoning".` });
+  const before = all.filter(n => n.flags.some(f => f.code === 'seenbefore'));
+  if (before.length) out.push({ cls: 'warn', text: `${before.length} adres(sen) kwamen al voor in een eerder onderzoek op dit apparaat.` });
+  if (origins.starts.size) out.push({ text: `${origins.starts.size} startwallet(s) gevonden waar geld vandaan kwam${current.role === 'perp' ? ': mogelijke andere slachtoffers' : ''}.` });
+  if (origins.cashIn.length) out.push({ text: `${origins.cashIn.length} storting(en) kwamen rechtstreeks van een exchange of dienst (${nameList(origins.cashIn.map(r => r.name))}). Transactie-hash en tijdstip staan in het rapport.` });
+  return out;
+}
+
+function renderSummary() {
+  const lines = summaryLines();
+  $('#summary').hidden = !lines.length;
+  $('#summaryList').innerHTML = lines.map(l => `<li class="${l.cls || ''}">${esc(l.text)}</li>`).join('');
+}
+
+// ---------- PDF-rapport ----------
+const pdfSafe = v => String(v ?? '').replace(/…/g, '...').replace(/→/g, '->').replace(/[—–]/g, '-').replace(/×/g, 'x').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[^\x00-\xFF]/g, '');
+const utc = t => t ? new Date(t * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '';
+
+async function exportPdf() {
+  if (!window.jspdf || !nodes.size || !current) return;
+  setStatus('PDF-rapport maken…');
+  try {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const W = 210, M = 14, S = pdfSafe;
+    const seed = nodes.get(current.seedKey);
+    const pat = window.PATTERNS[current.pattern];
+    const cls = n => nodeClass(n);
+    const name = n => (n && labelOf(n)) || '';
+    let y = 0;
+
+    doc.setFillColor(23, 30, 38); doc.rect(0, 0, W, 36, 'F');
+    doc.setFillColor(78, 161, 255); doc.rect(0, 0, 3, 36, 'F');
+    doc.setTextColor(255); doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
+    doc.text('ChainTrace onderzoeksrapport', M, 14);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.setTextColor(190);
+    doc.text(S(`${pat.name}  |  ${CHAIN_NAME[current.chain]}  |  gemaakt op ${new Date().toLocaleString('nl-NL')}`), M, 21.5);
+    doc.setFont('courier', 'normal'); doc.setFontSize(10); doc.setTextColor(255);
+    doc.text(seed.addr, M, 29.5);
+    y = 46;
+
+    const room = need => { if (y + need > 284) { doc.addPage(); y = 18; } };
+    const heading = t => {
+      room(22);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor(20);
+      doc.text(S(t), M, y);
+      doc.setDrawColor(78, 161, 255); doc.setLineWidth(0.5); doc.line(M, y + 1.6, W - M, y + 1.6);
+      y += 7.5;
+    };
+    const para = (t, size = 9.5, color = 45, indent = 0) => {
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(size); doc.setTextColor(color);
+      for (const line of doc.splitTextToSize(S(t), W - 2 * M - indent)) { room(6); doc.text(line, M + indent, y); y += size * 0.46; }
+      y += 1.6;
+    };
+    const mono = { font: 'courier', fontSize: 6.3 };
+    const table = (head, body, columnStyles = {}) => {
+      doc.autoTable({
+        startY: y, head: [head], body: body.map(r => r.map(S)), margin: { left: M, right: M, bottom: 16 },
+        styles: { font: 'helvetica', fontSize: 7.5, cellPadding: 1.3, overflow: 'linebreak', textColor: 30, lineColor: 225, lineWidth: 0.1 },
+        headStyles: { fillColor: [23, 30, 38], textColor: 255, fontSize: 7.5 },
+        alternateRowStyles: { fillColor: [244, 246, 249] }, columnStyles
+      });
+      y = doc.lastAutoTable.finalY + 8;
+    };
+    const none = t => para(t, 9, 110);
+
+    heading('Zaakgegevens');
+    table(['Gegeven', 'Waarde'], [
+      ['Onderzocht adres', seed.addr],
+      ['Dit adres is van', current.role === 'perp' ? 'de (vermoedelijke) dader' : 'het slachtoffer'],
+      ['Soort fraude', pat.name],
+      ['Blockchain', CHAIN_NAME[current.chain]],
+      ['Onderzoek uitgevoerd', new Date(current.started || Date.now()).toLocaleString('nl-NL')],
+      ['Omvang', `${nodes.size} adressen, ${edges.size} geldstromen`]
+    ], { 0: { cellWidth: 42, fontStyle: 'bold' } });
+
+    heading('Samenvatting');
+    for (const l of summaryLines()) para('-  ' + l.text);
+    y += 3;
+
+    // grafiek (als JPEG om het bestand klein te houden)
+    const img = await loadImage(graphImage('light', 2600));
+    const cv = document.createElement('canvas');
+    cv.width = img.width; cv.height = img.height;
+    const cx = cv.getContext('2d');
+    cx.fillStyle = '#fff'; cx.fillRect(0, 0, cv.width, cv.height); cx.drawImage(img, 0, 0);
+    const gs = Math.min((W - 2 * M) / img.width, 150 / img.height);
+    const gw = img.width * gs, gh = img.height * gs;
+    room(gh + 24);
+    heading('Geldstromen in beeld');
+    doc.setDrawColor(215); doc.setLineWidth(0.2); doc.rect(M, y, W - 2 * M, gh + 2);
+    doc.addImage(cv.toDataURL('image/jpeg', 0.9), 'JPEG', M + (W - 2 * M - gw) / 2, y + 1, gw, gh);
+    y += gh + 6;
+    para('Blauw = slachtoffer, lichtblauw = mogelijk slachtoffer/startwallet, rood = dader, oranje = verdacht, groen = exchange of dienst, paars = waarschuwingslijst, grijs = onbekend. Gestippelde blauwe lijnen tonen waar het geld vandaan kwam.', 8, 110);
+    y += 3;
+
+    const suspectCls = ['perp', 'suspect', 'sanction'];
+    const suspects = [...nodes.values()].filter(n => suspectCls.includes(cls(n)));
+    heading(`Verdachte adressen (${suspects.length})`);
+    if (!suspects.length) none('Geen adressen als verdacht aangemerkt.');
+    else table(['Adres', 'Naam / label', 'Beoordeling', 'Waarom'], suspects.map(n => [
+      n.addr, name(n), CLASS_NL[cls(n)],
+      [n.hint === 'suspect' && current.role === 'victim' && n.depth === 1 ? 'Ontving geld rechtstreeks van het slachtoffer' : '', ...n.flags.filter(f => !['contract', 'error'].includes(f.code)).map(f => f.text)].filter(Boolean).join('; ')
+    ]), { 0: { ...mono, cellWidth: 52 }, 1: { cellWidth: 30 }, 2: { cellWidth: 24 } });
+
+    const txRows = (filter, limit = 400) => {
+      const rows = [];
+      for (const e of edges.values()) {
+        const a = nodes.get(e.source), b = nodes.get(e.target);
+        if (!a || !b || !filter(a, b)) continue;
+        for (const t of e.txs) rows.push({ t, a, b });
+      }
+      return rows.sort((x, z) => (x.t.time || 0) - (z.t.time || 0)).slice(0, limit);
+    };
+    const txCols = { 0: { cellWidth: 24 }, 1: { ...mono, cellWidth: 38 }, 2: { ...mono, cellWidth: 38 }, 3: { cellWidth: 24 }, 4: { ...mono } };
+    const txBody = rows => rows.map(({ t, a, b }) => [utc(t.time), (name(a) ? name(a) + ' ' : '') + a.addr, (name(b) ? name(b) + ' ' : '') + b.addr, `${fmt(t.value)} ${t.asset}`, t.txid]);
+
+    const susTx = txRows((a, b) => !a.upstream && (a.seed || suspectCls.includes(cls(a)) || suspectCls.includes(cls(b))));
+    heading(`Verdachte transacties (${susTx.length})`);
+    para('Alle transacties van het onderzochte adres en van of naar verdachte adressen. Met de transactie-hash kan iedereen de betaling controleren in een block explorer.', 8.5, 110);
+    if (!susTx.length) none('Geen transacties gevonden.');
+    else table(['Tijdstip', 'Van', 'Naar', 'Bedrag', 'Transactie-hash'], txBody(susTx), txCols);
+
+    const isExch = n => n.flags.some(f => f.code === 'exchange' || f.code === 'service');
+    const outTx = txRows((a, b) => !a.upstream && !b.upstream && isExch(b) && !isExch(a));
+    heading(`Uitbetaling via exchanges - cash-out (${outTx.length})`);
+    para('Hier verlaat het geld de blockchain. Met deze gegevens kan de politie bij de exchange de rekeninghouder opvragen of om bevriezing vragen.', 8.5, 110);
+    if (!outTx.length) none('Geen stortingen bij een exchange gevonden binnen de zoekdiepte.');
+    else table(['Tijdstip', 'Van', 'Naar (exchange)', 'Bedrag', 'Transactie-hash'], txBody(outTx), txCols);
+
+    const cash = [...origins.cashIn].sort((a, b) => (a.time || 0) - (b.time || 0));
+    heading(`Geld afkomstig van exchanges - instroom (${cash.length})`);
+    if (!cash.length) none('Geen instroom vanuit een exchange gevonden binnen de zoekdiepte.');
+    else table(['Tijdstip', 'Exchange / dienst', 'Naar wallet', 'Bedrag', 'Transactie-hash'],
+      cash.map(r => [utc(r.time), `${r.name} ${nodes.get(r.from)?.addr || ''}`, nodes.get(r.to)?.addr || '', `${fmt(r.value)} ${r.asset}`, r.txid]), txCols);
+
+    const starts = [...origins.starts.values()].sort((a, b) => b.usd - a.usd);
+    heading(`Startwallets - mogelijke slachtoffers of geldbronnen (${starts.length})`);
+    para('Adressen waar het geld begon: zonder eerdere instroom, of rechtstreeks gevuld vanuit een exchange. Bij fraude zijn dit vaak andere slachtoffers.', 8.5, 110);
+    if (!starts.length) none('Geen startwallets gevonden.');
+    else table(['Adres', 'Naam / label', 'Verstuurd', 'Eerste betaling', 'Toelichting'],
+      starts.map(r => [r.addr, name(nodes.get(r.key)), assetText(r.assets), utc(r.first), r.reason]),
+      { 0: { ...mono, cellWidth: 52 }, 1: { cellWidth: 26 }, 2: { cellWidth: 28 }, 3: { cellWidth: 26 } });
+
+    heading(`Alle adressen in dit onderzoek (${nodes.size})`);
+    table(['Adres', 'Naam / label', 'Beoordeling', 'Stap', 'Notitie'],
+      [...nodes.values()].sort((a, b) => (a.depth || 0) - (b.depth || 0)).map(n => [n.addr, name(n), (n.seed ? 'Startadres - ' : '') + CLASS_NL[cls(n)], (n.upstream ? '-' : '') + (n.depth || 0), notes.nodes[n.key] || '']),
+      { 0: { ...mono, cellWidth: 56 }, 1: { cellWidth: 34 }, 2: { cellWidth: 32 }, 3: { cellWidth: 10 } });
+
+    if (notes.case) {
+      heading('Notities bij deze zaak');
+      for (const line of notes.case.split(/\n+/)) para(line);
+      y += 3;
+    }
+
+    heading('Vervolgstappen');
+    pat.steps.forEach((st, i) => para(`${i + 1}.  ${st}`));
+    y += 3;
+
+    heading('Toelichting');
+    para('Dit rapport is automatisch gemaakt met ChainTrace (open source) op basis van openbare blockchaingegevens (mempool.space, Blockscout, TronGrid) en openbare lijsten (OFAC, ScamSniffer, GraphSense, Ransomwhere, Forta, Etherscan-labels, Tether-blacklist). De beoordelingen "verdacht", "mogelijk slachtoffer" en "exchange" zijn aanwijzingen op basis van patronen en labels, geen bewijs. Controleer transacties altijd met de transactie-hash in een block explorer. Per adres zijn alleen de meest recente transacties onderzocht.', 8.5, 90);
+
+    const pages = doc.getNumberOfPages();
+    for (let i = 1; i <= pages; i++) {
+      doc.setPage(i);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(140);
+      doc.text(S(`ChainTrace  |  ${short(seed.addr)}  |  ${new Date().toLocaleDateString('nl-NL')}`), M, 291);
+      doc.text(`Pagina ${i} van ${pages}`, W - M, 291, { align: 'right' });
+    }
+    saveFile(`chaintrace-rapport-${stamp()}.pdf`, 'application/pdf', doc.output('datauristring'), true);
+    setStatus(`PDF-rapport opgeslagen (${pages} pagina's).`);
+    return doc;
+  } catch (err) {
+    setStatus('PDF maken mislukt: ' + err.message, true);
+    throw err;
+  }
+}
+
 function importJson(text) {
   const d = JSON.parse(text);
   if (d.tool !== 'ChainTrace') throw new Error('Geen ChainTrace-dossier');
@@ -1194,6 +1397,7 @@ function importJson(text) {
   if (d.notes) { notes = { case: d.notes.case || '', nodes: d.notes.nodes || {} }; $('#caseNote').value = notes.case; saveNotes(); }
   render(true);
   renderPlaybook();
+  renderSummary();
   setStatus(`Dossier geladen: ${nodes.size} adressen.`);
 }
 
@@ -1204,6 +1408,7 @@ function resetGraph() {
   if (cy) cy.elements().remove();
   hideDetail();
   $('#playbook').hidden = true;
+  $('#summary').hidden = true;
 }
 
 function setStatus(t, err = false) { const s = $('#status'); s.textContent = t; s.classList.toggle('err', err); }
@@ -1218,9 +1423,10 @@ function updateChainHint() {
   const a = $('#addr').value.trim();
   const sel = $('#chain').value;
   const det = detectChain(a);
-  $('#chainHint').textContent = !a ? 'Keten wordt automatisch herkend'
-    : det ? `Herkend: ${CHAIN_NAME[det]}${det === 'eth' ? ' (kies Optimism voor die keten)' : ''}` + (sel !== 'auto' ? ` · gekozen: ${CHAIN_NAME[sel]}` : '')
-    : 'Onbekend adresformaat';
+  $('#chainHint').textContent = !a ? 'Bitcoin, Ethereum en Tron worden automatisch herkend'
+    : det ? `✓ Dit is een ${CHAIN_NAME[det]}-adres` + (sel !== 'auto' ? ` · gekozen keten: ${CHAIN_NAME[sel]}` : '')
+    : 'Dit lijkt geen geldig Bitcoin-, Ethereum- of Tron-adres. Controleer of je het hele adres hebt gekopieerd.';
+  $('#chainHint').classList.toggle('bad', !!a && !det);
 }
 
 function applyPatternDefaults() {
@@ -1231,8 +1437,32 @@ function applyPatternDefaults() {
 }
 
 function setup() {
-  $('#pattern').innerHTML = Object.entries(window.PATTERNS).map(([k, p]) => `<option value="${k}">${esc(p.name)}</option>`).join('');
+  const pats = Object.entries(window.PATTERNS).sort((a, b) => (b[0] === 'generic') - (a[0] === 'generic'));
+  $('#pattern').innerHTML = pats.map(([k, p]) => `<option value="${k}">${esc(k === 'generic' ? 'Weet ik niet / iets anders' : p.name)}</option>`).join('');
   applyPatternDefaults();
+  const roleHint = () => {
+    $('#roleHint').textContent = document.querySelector('input[name=role]:checked').value === 'perp'
+      ? 'De app zoekt waar de dader het geld heen stuurde én wie er nog meer geld naartoe stuurde.'
+      : 'De app volgt waar het geld van het slachtoffer naartoe is gegaan.';
+  };
+  document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', roleHint));
+  roleHint();
+  const recent = store.get('chaintrace.recent', []);
+  const fillRecent = () => { $('#recentAddrs').innerHTML = recent.map(a => `<option value="${esc(a)}">`).join(''); };
+  fillRecent();
+  $('#btnPaste').addEventListener('click', async () => {
+    let txt = '';
+    try { txt = window.AndroidBridge?.readClipboard ? window.AndroidBridge.readClipboard() : await navigator.clipboard.readText(); } catch { /* geen toegang */ }
+    txt = (txt || '').trim();
+    if (!txt) { setStatus('Plakken lukt hier niet automatisch. Houd het veld ingedrukt en kies Plakken.', true); return; }
+    $('#addr').value = txt;
+    updateChainHint();
+    setStatus('');
+  });
+  $('#btnPdf').addEventListener('click', () => exportPdf().catch(() => {}));
+  $('#btnPdf2').addEventListener('click', () => exportPdf().catch(() => {}));
+  $('#moreMenu').addEventListener('click', ev => { if (ev.target.closest('.menu-items')) setTimeout(() => { $('#moreMenu').open = false; }, 0); });
+  document.addEventListener('click', ev => { if (!ev.target.closest('#moreMenu')) $('#moreMenu').open = false; });
   $('#pattern').addEventListener('change', applyPatternDefaults);
   $('#addr').addEventListener('input', updateChainHint);
   $('#chain').addEventListener('change', updateChainHint);
@@ -1243,7 +1473,13 @@ function setup() {
     const det = detectChain(addr);
     let chain = $('#chain').value;
     if (chain === 'auto') chain = det;
-    if (!chain) { setStatus('Onbekend adresformaat. Kies handmatig een keten.', true); return; }
+    if (!chain) { setStatus('Dit adres wordt niet herkend. Controleer of je het hele adres hebt geplakt.', true); return; }
+    const ri = recent.indexOf(addr);
+    if (ri >= 0) recent.splice(ri, 1);
+    recent.unshift(addr);
+    recent.length = Math.min(recent.length, 8);
+    store.set('chaintrace.recent', recent);
+    fillRecent();
     if (det && (isEvm(det) !== isEvm(chain) || (!isEvm(det) && det !== chain))) { setStatus(`Adres past niet bij ${CHAIN_NAME[chain]}.`, true); return; }
     const role = document.querySelector('input[name=role]:checked').value;
     const pattern = $('#pattern').value;
@@ -1337,5 +1573,5 @@ function setupDbDialog() {
 
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, notes: () => notes };
+window.ChainTrace = { runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

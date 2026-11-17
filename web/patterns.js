@@ -95,7 +95,7 @@ window.PATTERNS = {
   },
   generic: {
     name: 'Onbekend / algemeen',
-    info: 'Algemene trace in beide richtingen met alle heuristieken.',
+    info: 'Geen probleem: de app zoekt breed en let op alle bekende signalen.',
     depth: 2, fanout: 6,
     dir: { victim: 'out', perp: 'both' },
     focus: [],

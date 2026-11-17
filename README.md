@@ -65,8 +65,14 @@ Android:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## Dossier
-"Dossier" exporteert alle adressen, labels, bevindingen en transacties als JSON; "PNG" exporteert het web als afbeelding. Een dossier kan weer worden geïmporteerd.
+## Rapporten en export
+- **PDF-rapport** — zaakgegevens, samenvatting in gewone taal, het geldstroom-web, verdachte adressen, verdachte transacties (tijdstip, van, naar, bedrag, volledige hash), cash-out bij exchanges, instroom vanuit exchanges, startwallets, alle adressen, notities en vervolgstappen.
+- **Afbeelding** — rapport als PNG (licht of donker) of alleen het web in hoge resolutie.
+- **Herkomst-CSV** — startwallets en exchange-instroom met hash en tijdstip.
+- **Dossier (JSON)** — alles, opnieuw te openen in de app.
+
+## Herkomst van het geld
+Na elke trace volgt de app het inkomende geld terug tot een exchange/dienst (instroompunt, met hash en tijdstip) of een **startwallet**: een adres zonder eerdere instroom of rechtstreeks gevuld vanuit een exchange — mogelijk een ander slachtoffer.
 
 ## Licentie
 MIT

@@ -16,10 +16,16 @@
     </div>
   </div>
   <div class="top-actions">
-    <button id="btnDb" class="ghost" hidden>Database</button>
-    <button id="btnExportPng" class="ghost" disabled>Afbeelding</button>
-    <button id="btnExportJson" class="ghost" disabled>Dossier</button>
-    <label class="ghost filebtn">Importeer<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
+    <button id="btnPdf" class="ghost accent" disabled>PDF-rapport</button>
+    <details class="menu" id="moreMenu">
+      <summary class="ghost">Meer</summary>
+      <div class="menu-items">
+        <button id="btnExportPng" type="button" disabled>Afbeelding opslaan</button>
+        <button id="btnExportJson" type="button" disabled>Dossier opslaan</button>
+        <label class="filebtn">Dossier openen<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
+        <button id="btnDb" type="button" hidden>OSINT-database</button>
+      </div>
+    </details>
   </div>
 </header>
 
@@ -27,72 +33,83 @@
   <section class="panel form-panel">
     <form id="traceForm" autocomplete="off">
       <label class="field">
-        <span>Walletadres</span>
-        <input id="addr" type="text" spellcheck="false" placeholder="bc1… / 1… / 3… · 0x… · T…" required>
-        <small id="chainHint" class="hint">Keten wordt automatisch herkend</small>
-      </label>
-
-      <label class="field">
-        <span>Keten</span>
-        <select id="chain">
-          <option value="auto">Automatisch</option>
-          <option value="btc">Bitcoin</option>
-          <option value="eth">Ethereum (ETH + ERC-20)</option>
-          <option value="op">Optimism (ETH + ERC-20)</option>
-          <option value="tron">Tron (TRC-20, o.a. USDT)</option>
-        </select>
+        <span>1. Welk walletadres wil je onderzoeken?</span>
+        <div class="addr-row">
+          <input id="addr" type="text" spellcheck="false" placeholder="Plak hier het adres" list="recentAddrs" required>
+          <button type="button" id="btnPaste" class="ghost">Plak</button>
+        </div>
+        <datalist id="recentAddrs"></datalist>
+        <small id="chainHint" class="hint">Bitcoin, Ethereum en Tron worden automatisch herkend</small>
       </label>
 
       <fieldset class="field">
-        <span>Rol van dit adres</span>
+        <span>2. Van wie is dit adres?</span>
         <div class="seg">
           <input type="radio" name="role" id="roleVictim" value="victim" checked>
           <label for="roleVictim" class="victim">Slachtoffer</label>
           <input type="radio" name="role" id="rolePerp" value="perp">
           <label for="rolePerp" class="perp">Dader</label>
         </div>
+        <small id="roleHint" class="hint"></small>
       </fieldset>
 
       <label class="field">
-        <span>Fraudepatroon</span>
+        <span>3. Wat is er gebeurd? <em class="opt">(mag je overslaan)</em></span>
         <select id="pattern"></select>
         <small id="patternInfo" class="hint"></small>
       </label>
 
       <details class="field adv">
-        <summary>Geavanceerd</summary>
-        <label class="row"><span>Diepte (hops)</span><input id="depth" type="number" min="1" max="4" value="2"></label>
+        <summary>Geavanceerde instellingen</summary>
+        <label class="row"><span>Keten</span>
+          <select id="chain">
+            <option value="auto">Automatisch</option>
+            <option value="btc">Bitcoin</option>
+            <option value="eth">Ethereum</option>
+            <option value="op">Optimism</option>
+            <option value="tron">Tron</option>
+          </select>
+        </label>
+        <label class="row"><span>Aantal stappen volgen</span><input id="depth" type="number" min="1" max="4" value="2"></label>
         <label class="row"><span>Max. tegenpartijen per adres</span><input id="fanout" type="number" min="2" max="25" value="6"></label>
         <label class="row"><span>Max. adressen totaal</span><input id="maxNodes" type="number" min="10" max="300" value="80"></label>
       </details>
 
-      <button type="submit" id="btnTrace" class="primary">Traceer &amp; bouw web</button>
+      <button type="submit" id="btnTrace" class="primary">Start onderzoek</button>
       <button type="button" id="btnStop" class="ghost" hidden>Stop</button>
       <div id="status" class="status" aria-live="polite"></div>
     </form>
 
-    <div class="origins" id="origins" hidden>
-      <h2>Herkomst van het geld <button id="btnOriginsCsv" class="mini" type="button">CSV</button></h2>
-      <h3>Instroom via exchanges <span id="cashCount" class="badge">0</span></h3>
+    <div class="summary" id="summary" hidden>
+      <h2>Samenvatting</h2>
+      <ul id="summaryList"></ul>
+      <button id="btnPdf2" class="primary" type="button">Maak PDF-rapport</button>
+    </div>
+
+    <details class="sec playbook" id="playbook" hidden open>
+      <summary>Wat kun je nu doen?</summary>
+      <ol id="playbookList"></ol>
+    </details>
+
+    <details class="sec origins" id="origins" hidden>
+      <summary>Waar kwam het geld vandaan? <span id="originCount" class="badge">0</span></summary>
+      <p class="hint">Startwallets zijn adressen waar het geld begon: mogelijke andere slachtoffers. Bij een exchange kan de politie opvragen wie de klant is.</p>
+      <h3>Geld dat van een exchange kwam <span id="cashCount" class="badge">0</span></h3>
       <ul id="cashList" class="olist"></ul>
       <h3>Startwallets · mogelijke slachtoffers <span id="startCount" class="badge">0</span></h3>
       <ul id="startList" class="olist"></ul>
-    </div>
+      <button id="btnOriginsCsv" class="ghost wide" type="button">Lijst opslaan als CSV (Excel)</button>
+    </details>
 
-    <div class="notesbox" id="notesBox" hidden>
-      <h2>Notities bij deze zaak</h2>
-      <textarea id="caseNote" class="note" rows="4" placeholder="Aangiftenummer, contact met exchange, verklaringen, vervolgstappen…"></textarea>
-    </div>
-
-    <div class="findings">
-      <h2>Bevindingen <span id="findCount" class="badge">0</span></h2>
+    <details class="sec findings" id="findingsBox" hidden>
+      <summary>Opvallende adressen <span id="findCount" class="badge">0</span></summary>
       <ul id="findings"></ul>
-    </div>
+    </details>
 
-    <div class="playbook" id="playbook" hidden>
-      <h2>Vervolgstappen</h2>
-      <ol id="playbookList"></ol>
-    </div>
+    <details class="sec notesbox" id="notesBox" hidden>
+      <summary>Notities bij deze zaak</summary>
+      <textarea id="caseNote" class="note" rows="4" placeholder="Aangiftenummer, contact met exchange, verklaringen, vervolgstappen…"></textarea>
+    </details>
   </section>
 
   <section class="graph-wrap">
@@ -104,6 +121,7 @@
     </div>
     <div class="legend">
       <span><i class="dot victim"></i>Slachtoffer</span>
+      <span><i class="dot victim2"></i>Mogelijk slachtoffer</span>
       <span><i class="dot perp"></i>Dader</span>
       <span><i class="dot suspect"></i>Verdacht</span>
       <span><i class="dot exchange"></i>Exchange/dienst</span>
@@ -111,7 +129,15 @@
       <span><i class="dot plain"></i>Onbekend</span>
     </div>
     <div id="empty" class="empty">
-      <p>Voer een adres in, kies <b>slachtoffer</b> of <b>dader</b> en een fraudepatroon.<br>Het geldstroom-web wordt live opgebouwd.</p>
+      <div class="steps">
+        <h2>Volg het geld in drie stappen</h2>
+        <ol>
+          <li><b>Plak een walletadres</b> — van het slachtoffer of van de dader.</li>
+          <li><b>Start het onderzoek</b> — de app tekent waar het geld heen ging en waar het vandaan kwam.</li>
+          <li><b>Maak een PDF-rapport</b> — met alle adressen en transacties, voor je aangifte.</li>
+        </ol>
+        <p>Geen account nodig. Je gegevens blijven op dit apparaat.</p>
+      </div>
     </div>
   </section>
 
@@ -156,6 +182,8 @@
 </footer>
 
 <script src="vendor/cytoscape.min.js"></script>
+<script src="vendor/jspdf.umd.min.js"></script>
+<script src="vendor/jspdf.plugin.autotable.min.js"></script>
 <script src="patterns.js"></script>
 <script src="labels.js"></script>
 <script src="app.js"></script>

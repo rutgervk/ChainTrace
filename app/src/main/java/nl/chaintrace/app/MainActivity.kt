@@ -102,6 +102,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private inner class Bridge {
+        /** Tekst van het klembord, voor de Plak-knop (navigator.clipboard werkt niet in een WebView). */
+        @JavascriptInterface
+        fun readClipboard(): String = runCatching {
+            val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString() ?: ""
+        }.getOrDefault("")
+
         private val db get() = OsintDb.get(this@MainActivity)
 
         /** Labels uit de lokale OSINT-database + eigen eerdere waarnemingen (andere zaken). */
