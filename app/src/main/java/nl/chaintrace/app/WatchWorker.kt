@@ -53,7 +53,14 @@ class WatchWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx,
         val sigs = HashMap<String, String>()
         for (i in 0 until list.length()) {
             val w = list.getJSONObject(i)
-            val sig = runCatching { sig(w.getString("chain"), w.getString("addr")) }
+            // Wallet-tracker: vingerafdruk van alle adressen van de wallet samen (zelfde opbouw als sigOf in app.js).
+            val members = w.optJSONArray("members")
+            val sig = runCatching {
+                if (members == null) sig(w.getString("chain"), w.getString("addr"))
+                else (0 until minOf(members.length(), 20)).map { i ->
+                    sig(w.getString("chain"), members.getString(i)).also { Thread.sleep(250) }
+                }.also { parts -> if (parts.any { it.isEmpty() }) throw RuntimeException("niet alle adressen bereikbaar") }.joinToString(",")
+            }
                 .onFailure { Log.w(TAG, "controle ${w.optString("addr")} mislukt: ${it.message}") }.getOrNull() ?: continue
             sigs[w.getString("chain") + ":" + w.getString("addr")] = sig
             Thread.sleep(400)

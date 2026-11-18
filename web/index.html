@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#171e26">
 <title>ChainTrace</title>
-<link rel="stylesheet" href="style.css?v=2.0">
+<link rel="stylesheet" href="style.css?v=2.1">
 </head>
 <body>
 <header class="topbar">
@@ -44,6 +44,8 @@
     <div id="watchBanner" class="banner watchb" hidden><span>🔔 <b id="watchBannerText"></b></span><button type="button" id="watchBannerBtn" class="ghost">Bekijk</button></div>
     <div id="demoBanner" class="banner demob" hidden><span>📘 Dit is een <b>voorbeeldzaak met verzonnen gegevens</b>.</span><button type="button" id="btnDemoStop" class="ghost">Stop voorbeeld</button></div>
     <div id="caseBar" class="casebar"><span>📁 Zaak: <b id="caseName">nog geen zaak</b> <small id="caseCount" class="muted"></small></span><button type="button" id="btnCases2" class="ghost">Mijn zaken</button></div>
+    <details id="formBox" class="formbox" open>
+    <summary><span id="formSummaryText">🔎 <b>Nieuw onderzoek</b></span><span id="formSummaryHint" class="fs-hint"></span></summary>
     <form id="traceForm" autocomplete="off">
       <label class="field">
         <span>1. Welk walletadres wil je onderzoeken? <button type="button" class="qmark" data-help="address" aria-label="Uitleg walletadres">?</button></span>
@@ -96,10 +98,12 @@
       </details>
 
       <button type="submit" id="btnTrace" class="primary">Start onderzoek</button>
-      <button type="button" id="btnStop" class="ghost" hidden>Stop</button>
-      <div id="status" class="status" aria-live="polite"></div>
-      <div id="chainPick" class="chainpick" hidden></div>
     </form>
+    </details>
+    <button type="button" id="btnStop" class="ghost" hidden>Stop</button>
+    <div id="status" class="status" aria-live="polite"></div>
+    <div id="chainPick" class="chainpick" hidden></div>
+    <div id="overview" class="overview" hidden></div>
 
     <div class="summary" id="summary" hidden>
       <h2>Samenvatting <button type="button" id="speakSummary" class="speak" data-speak="#summaryList">🔊 Lees voor</button></h2>
@@ -108,17 +112,17 @@
     </div>
 
     <details class="sec route" id="routeBox" hidden open>
-      <summary>Het geld stap voor stap <button type="button" id="speakRoute" class="speak" data-speak="#routeList">🔊</button></summary>
+      <summary><span class="sec-ic">🧭</span>Het geld stap voor stap <button type="button" id="speakRoute" class="speak" data-speak="#routeList">🔊</button></summary>
       <div id="routeList"></div>
     </details>
 
-    <details class="sec playbook" id="playbook" hidden open>
-      <summary>Wat kun je nu doen?</summary>
+    <details class="sec playbook" id="playbook" hidden>
+      <summary><span class="sec-ic">📋</span>Wat kun je nu doen?</summary>
       <ol id="playbookList"></ol>
     </details>
 
     <details class="sec origins" id="origins" hidden>
-      <summary>Waar kwam het geld vandaan? <span id="originCount" class="badge">0</span></summary>
+      <summary><span class="sec-ic">↩️</span>Waar kwam het geld vandaan? <span id="originCount" class="badge">0</span></summary>
       <p class="hint">Startwallets zijn adressen waar het geld begon: mogelijke andere slachtoffers. Bij een exchange kan de politie opvragen wie de klant is.</p>
       <h3>Geld dat van een exchange kwam <span id="cashCount" class="badge">0</span></h3>
       <ul id="cashList" class="olist"></ul>
@@ -128,12 +132,12 @@
     </details>
 
     <details class="sec findings" id="findingsBox" hidden>
-      <summary>Opvallende adressen <span id="findCount" class="badge">0</span></summary>
+      <summary><span class="sec-ic">⚠️</span>Opvallende adressen <span id="findCount" class="badge">0</span></summary>
       <ul id="findings"></ul>
     </details>
 
     <details class="sec notesbox" id="notesBox" hidden>
-      <summary>Notities bij deze zaak</summary>
+      <summary><span class="sec-ic">📝</span>Notities bij deze zaak</summary>
       <textarea id="caseNote" class="note" rows="4" placeholder="Aangiftenummer, contact met exchange, verklaringen, vervolgstappen…"></textarea>
     </details>
   </section>
@@ -278,6 +282,12 @@
   <label class="field"><span>TronGrid-sleutel (optioneel)</span><input id="setTron" type="text" spellcheck="false" placeholder="bijv. 1a2b3c4d-…">
     <small class="hint">Gratis aan te maken op trongrid.io. Maakt Tron-onderzoek ongeveer 8× sneller.</small></label>
   <p class="small muted">Sleutels blijven alleen op dit apparaat.</p>
+  <div class="field checks"><span>Adressen samenvoegen tot één wallet/beheerder (eigen regels)</span>
+    <label><input type="checkbox" id="clInput" checked> Samen als input gebruikt (Bitcoin/Litecoin)</label>
+    <label><input type="checkbox" id="clChange" checked> Wisselgeld-adres (Bitcoin/Litecoin)</label>
+    <label><input type="checkbox" id="clDeposit" checked> Zelfde stortingsadres bij een exchange</label>
+    <label><input type="checkbox" id="clGas" checked> Startgeld voor transactiekosten (Ethereum, Tron, Solana…)</label>
+  </div>
   <p id="setMsg" class="small"></p>
   <div class="lbtns"><button type="button" id="setTest" class="ghost">Testen</button><button type="button" id="setSave" class="primary">Opslaan</button></div>
 </dialog>
@@ -296,13 +306,13 @@
   Data: mempool.space · Blockscout · TronGrid · OFAC-lijst (0xB10C) · ScamSniffer. Heuristieken zijn aanwijzingen, geen bewijs.
 </footer>
 
-<script src="i18n.js?v=2.0"></script>
+<script src="i18n.js?v=2.1"></script>
 <script src="vendor/cytoscape.min.js"></script>
 <script src="vendor/jspdf.umd.min.js"></script>
 <script src="vendor/jspdf.plugin.autotable.min.js"></script>
 <script src="vendor/jsQR.js"></script>
-<script src="patterns.js?v=2.0"></script>
-<script src="labels.js?v=2.0"></script>
-<script src="app.js?v=2.0"></script>
+<script src="patterns.js?v=2.1"></script>
+<script src="labels.js?v=2.1"></script>
+<script src="app.js?v=2.1"></script>
 </body>
 </html>

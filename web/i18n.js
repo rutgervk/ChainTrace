@@ -389,6 +389,19 @@ const PDF_EXTRA = {
   'Programma': 'Program', 'Rapport gemaakt (UTC)': 'Report created (UTC)', 'Instellingen': 'Settings', 'Tijdvolgorde': 'Time order', 'aan': 'on', 'uit': 'off',
   'Alleen geld gevolgd dat vertrok nadat het op het adres binnenkwam.': 'Only money that left after it arrived at the address was followed.',
   'Uit: alle uitgaande betalingen gevolgd.': 'Off: all outgoing payments followed.',
+  // v2.1
+  'Nieuw onderzoek': 'New investigation', 'Wijzigen': 'Change', 'adressen': 'addresses', 'verdacht': 'suspicious', 'exchanges': 'exchanges',
+  'stortingsadressen': 'deposit addresses', 'wallets': 'wallets', 'mogelijke slachtoffers': 'possible victims',
+  'samen als input gebruikt': 'used together as input', 'wisselgeld van dezelfde wallet': 'change of the same wallet', 'stort op hetzelfde stortingsadres': 'deposits to the same deposit address',
+  'kreeg startgeld (gas) van dit adres': 'got starting funds (gas) from this address',
+  'Volg het geld van de hele wallet': 'Follow the money of the whole wallet', '🔔 Volg deze wallet': '🔔 Watch this wallet', '🔕 Wallet niet meer volgen': '🔕 Stop watching wallet',
+  'Deze wallet wordt niet meer gevolgd.': 'This wallet is no longer watched.', 'Wallet wordt vastgelegd…': 'Recording wallet…',
+  'Zelfde wallet of beheerder': 'Same wallet or controller',
+  "Eén persoon kan veel adressen hebben. De app voegt adressen samen met vier eigen regels: (1) Bitcoin/Litecoin-adressen die samen als bron (input) in één transactie zitten; (2) het wisselgeld-adres van zo'n transactie; (3) adressen die op hetzelfde klant-stortingsadres bij een exchange storten; (4) een nieuw adres dat eerst een klein bedrag voor transactiekosten krijgt van een adres uit het onderzoek en daarna tokens doorstuurt. Slachtoffers, exchanges en CoinJoin-transacties worden nooit samengevoegd. De regels staan onder Instellingen.":
+    "One person can have many addresses. The app merges addresses with four built-in rules: (1) Bitcoin/Litecoin addresses used together as sources (inputs) in one transaction; (2) the change address of such a transaction; (3) addresses that deposit to the same customer deposit address at an exchange; (4) a new address that first receives a small amount for transaction fees from an address in the investigation and then forwards tokens. Victims, exchanges and CoinJoin transactions are never merged. The rules are under Settings.",
+  'Adressen samenvoegen tot één wallet/beheerder (eigen regels)': 'Merge addresses into one wallet/controller (built-in rules)',
+  'Samen als input gebruikt (Bitcoin/Litecoin)': 'Used together as input (Bitcoin/Litecoin)', 'Wisselgeld-adres (Bitcoin/Litecoin)': 'Change address (Bitcoin/Litecoin)',
+  'Zelfde stortingsadres bij een exchange': 'Same deposit address at an exchange', 'Startgeld voor transactiekosten (Ethereum, Tron, Solana…)': 'Starting funds for transaction fees (Ethereum, Tron, Solana…)',
   'Opgehaald (UTC)': 'Fetched (UTC)', 'Geladen': 'Loaded', 'Volledig?': 'Complete?', 'nee, alleen recentste': 'no, most recent only', 'ja': 'yes', 'voorbeeldgegevens': 'example data'
 };
 patterns.push(
@@ -407,6 +420,12 @@ patterns.push(
   ['Bij dit rapport hoort het dossierbestand "{0}" met alle adressen, geldstromen en instellingen. De SHA-256-vingerafdruk van dat bestand is:', 'This report comes with the file "{0}" containing all addresses, money flows and settings. The SHA-256 fingerprint of that file is:'],
   ['stappen {0}, tegenpartijen {1}, max. adressen {2}, tijdvolgorde {3}', 'hops {0}, counterparties {1}, max. addresses {2}, time order {3}'],
   ['PDF-rapport en dossierbestand opgeslagen ({#0} pagina\'s).', 'PDF report and evidence file saved ({0} pages).'],
+  ['👥 Zelfde beheerder (vermoedelijk): {#0} adressen', '👥 Same controller (probably): {0} addresses'], ['Zelfde beheerder · {#0} adressen', 'Same controller · {0} addresses'],
+  ['Hele wallet in het web ({#0} erbij)', 'Whole wallet in the graph ({0} more)'],
+  ['Geld van {#0} wallet-adressen gevolgd: {#1} adressen, {#2} geldstromen.', 'Followed the money of {0} wallet addresses: {1} addresses, {2} money flows.'],
+  ['Deze wallet ({#0} adressen) wordt nu gevolgd. Je krijgt een melding als er op één van de adressen geld beweegt.', 'This wallet ({0} addresses) is now watched. You will be notified when money moves on any of its addresses.'],
+  ['De wallet heeft {#0} nieuw(e) adres(sen); de tracker volgt ze nu ook.', 'The wallet has {0} new address(es); the tracker now watches them too.'],
+  ['Wallet van {0} ({#1} adressen)', 'Wallet of {0} ({1} addresses)'], ['Beheerder van {0} ({#1} adressen)', 'Controller of {0} ({1} addresses)'],
   ['- {0}', '- {0}'], ['{#0}. {1}', '{0}. {1}'], ['{#0}. {1}: {2}', '{0}. {1}: {2}']
 );
 Object.assign(exact, PDF_EXTRA);

@@ -176,10 +176,10 @@ async function fetchBtc(addr, chain = 'btc', pages = 2) {
     all = all.concat(more);
     cursor = more.length >= 25 ? { last: more[more.length - 1].txid } : null;
   }
-  const { transfers, peelCount, coInputs } = parseBtcTxs(addr, all, SYM[chain]);
+  const { transfers, peelCount, coInputs, changeLinks } = parseBtcTxs(addr, all, SYM[chain]);
   const cs = info?.chain_stats;
   return {
-    transfers, peelCount, coInputs, meta: {}, cursor,
+    transfers, peelCount, coInputs, changeLinks, meta: {}, cursor,
     txCount: cs?.tx_count ?? all.length,
     balance: cs ? `${fmt((cs.funded_txo_sum - cs.spent_txo_sum) / 1e8)} ${SYM[chain]}` : null
   };
@@ -188,10 +188,24 @@ async function fetchBtc(addr, chain = 'btc', pages = 2) {
 function parseBtcTxs(addr, all, sym = 'BTC') {
   const transfers = [];
   const coInputs = [];
+  const changeLinks = [];
   let peelCount = 0;
   for (const tx of all) {
     const ins = [...new Set(tx.vin.map(v => v.prevout?.scriptpubkey_address).filter(Boolean))];
     if (ins.length >= 2 && ins.length <= MAX_GROUP && coInputs.length < 60) coInputs.push(ins);
+    // Wisselgeld: bij precies 2 nieuwe outputs is het wisselgeld vaak het adres van hetzelfde type als de inputs,
+    // en/of het bedrag dat níet rond is. Alleen als de signalen niet tegenstrijdig zijn.
+    const outsAll = tx.vout.filter(o => o.scriptpubkey_address && !ins.includes(o.scriptpubkey_address));
+    if (ins.length && ins.length <= MAX_GROUP && outsAll.length === 2 && tx.vout.length === 2 && changeLinks.length < 60) {
+      const inTypes = new Set(tx.vin.map(v => v.prevout?.scriptpubkey_type).filter(Boolean));
+      let byType = null;
+      if (inTypes.size === 1) { const m = outsAll.filter(o => inTypes.has(o.scriptpubkey_type)); if (m.length === 1) byType = m[0]; }
+      const round = o => o.value % 100000 === 0;
+      let byRound = null;
+      if (outsAll.filter(round).length === 1) byRound = outsAll.find(o => !round(o));
+      const pick = byType && byRound ? (byType === byRound ? byType : null) : (byType || byRound);
+      if (pick) changeLinks.push([ins[0], pick.scriptpubkey_address]);
+    }
     const outs = tx.vout.filter(o => o.scriptpubkey_address).map(o => ({ a: o.scriptpubkey_address, v: o.value / 1e8 }));
     const time = tx.status?.block_time || Math.floor(Date.now() / 1000);
     if (ins.includes(addr)) {
@@ -206,7 +220,7 @@ function parseBtcTxs(addr, all, sym = 'BTC') {
       if (recv > 0) for (const i of ins) transfers.push({ from: i, to: addr, value: recv / ins.length, asset: sym, time, txid: tx.txid });
     }
   }
-  return { transfers, peelCount, coInputs };
+  return { transfers, peelCount, coInputs, changeLinks };
 }
 
 async function fetchEvm(chain, addr) {
@@ -829,6 +843,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   stopped = false;
   resetGraph();
   demoMode = norm(chain, addr) === DEMO.victim || norm(chain, addr) === DEMO.scammer;
+  $('#formBox').open = false;
   current = { chain, role, pattern, opts, seedKey: keyOf(chain, addr), started: new Date().toISOString() };
   dbCache.clear();
   loadNotes();
@@ -1041,7 +1056,7 @@ function cyStyle(themeName) {
     { selector: 'node', style: {
       'background-color': 'data(color)', label: 'data(label)', color: t.text, 'font-size': 10,
       'text-valign': 'bottom', 'text-wrap': 'wrap', 'text-margin-y': 4, 'text-outline-color': t.bg, 'text-outline-width': 2,
-      width: 'data(size)', height: 'data(size)', 'border-width': 2, 'border-color': t.bg
+      width: 'data(size)', height: 'data(size)', 'border-width': 2, 'border-color': t.bg, 'text-max-width': 170, 'min-zoomed-font-size': 6
     } },
     { selector: 'node[?wallet]', style: {
       'background-color': '#4ea1ff', 'background-opacity': 0.07, 'border-style': 'dashed', 'border-width': 2, 'border-color': '#4ea1ff',
@@ -1131,7 +1146,7 @@ function runLayout(fit) {
   if (!document.getElementById('cy').offsetWidth) { graphStale = true; return; }
   const opts = layoutName === 'flow'
     ? { name: 'breadthfirst', directed: true, roots: current ? [current.seedKey] : undefined, spacingFactor: 1.2, animate: false }
-    : { name: 'cose', animate: false, randomize: !!fit, nodeRepulsion: () => 9000, idealEdgeLength: () => 110, gravity: 0.3, numIter: 600 };
+    : { name: 'cose', animate: false, randomize: !!fit, nodeRepulsion: () => 14000, idealEdgeLength: () => 130, gravity: 0.3, numIter: 800, nodeDimensionsIncludeLabels: true };
   // Wallet-groepen tijdelijk losmaken: de lay-out rekent slecht met groepen. Daarna de leden compact
   // rond hun middelpunt leggen en de groep weer vormen.
   const kids = cy.nodes().filter(n => !!n.data('parent'));
@@ -1543,6 +1558,7 @@ async function loadMoreTx(n) {
       n.data.cursor = d.cursor;
       n.data.peelCount = (n.data.peelCount || 0) + (d.peelCount || 0);
       if (d.coInputs?.length) { n.data.coInputs = [...(n.data.coInputs || []), ...d.coInputs]; invalidateClusters(); }
+      if (d.changeLinks?.length) { n.data.changeLinks = [...(n.data.changeLinks || []), ...d.changeLinks]; invalidateClusters(); }
       mergeMeta(n.chain, d.meta);
       fullAnalyze(n);
       const v = curView();
@@ -1623,6 +1639,8 @@ async function nodeAction(n, act) {
   if (act === 'show') { setTab('graph'); focusNode(n.key); return; }
   if (act === 'watch') { await toggleWatch(n); refreshView(); return; }
   if (act === 'wallet') { addWalletToGraph(n); refreshView(); return; }
+  if (act === 'walletwatch') { await toggleWalletWatch(n); refreshView(); return; }
+  if (act === 'walletfollow') { await followWallet(n); refreshView(); return; }
   if (act === 'add') { ensureCase(n); addToGraph(n); setStatus('Toegevoegd aan het web.'); return refreshView(); }
   if (n.ghost && ['perp', 'victim', 'expand', 'origins'].includes(act)) { ensureCase(n); n = addToGraph(n); }
   if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); refreshView(); recordObservations(); return; }
@@ -1935,6 +1953,8 @@ function summaryLines() {
 
 function renderSummary() {
   autosave();
+  renderFormSummary();
+  renderOverview();
   renderDemoBanner();
   const lines = summaryLines();
   $('#summary').hidden = !lines.length;
@@ -2340,6 +2360,7 @@ function setup() {
   setupFeatures();
   setupV19();
   setupV20();
+  setupUI21();
 
   // Tabbalk (telefoon), zoeken in de verkenner en het kaartje onder in het web.
   document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
@@ -2448,7 +2469,7 @@ const HELP = {
   dust: ['Spam / nul-transacties', 'Overboekingen van 0 of met nepmunten. Vaak bedoeld om een lijkt-op-adres in de geschiedenis van het slachtoffer te zetten.'],
   seenbefore: ['Eerder gezien', 'Dit adres kwam al voor in een ander onderzoek op dit apparaat.'],
   deposit: ['Stortingsadres', 'Bij een exchange krijgt elke klant een eigen stortingsadres. Wat daar binnenkomt, zet de exchange door naar een groot verzameladres (hot wallet). Een adres dat bijna al zijn geld naar één exchange doorstuurt, is daarom meestal het stortingsadres van één klant. Met dit adres kan de exchange de klant direct vinden.'],
-  cluster: ['Zelfde wallet', 'Bij Bitcoin en Litecoin kan één eigenaar veel adressen hebben. Als adressen samen als bron (input) in één transactie worden gebruikt, moet de eigenaar ze allemaal kunnen ondertekenen: ze horen dus vrijwel zeker bij dezelfde wallet. Uitzondering: speciale privacy-transacties (CoinJoin); die voegt de app niet samen.'],
+  cluster: ['Zelfde wallet of beheerder', 'Eén persoon kan veel adressen hebben. De app voegt adressen samen met vier eigen regels: (1) Bitcoin/Litecoin-adressen die samen als bron (input) in één transactie zitten; (2) het wisselgeld-adres van zo\'n transactie; (3) adressen die op hetzelfde klant-stortingsadres bij een exchange storten; (4) een nieuw adres dat eerst een klein bedrag voor transactiekosten krijgt van een adres uit het onderzoek en daarna tokens doorstuurt. Slachtoffers, exchanges en CoinJoin-transacties worden nooit samengevoegd. De regels staan onder Instellingen.'],
   overlap: ['Komt vaker voor', 'Dit adres komt voor in meerdere onderzoeken van dezelfde zaak. Dat is een belangrijk verband: bijvoorbeeld dezelfde oplichter bij verschillende slachtoffers.'],
   reputation: ['Reputatie', 'De blockchain-verkenner waarschuwt dat dit adres of deze munt niet te vertrouwen is.']
 };
@@ -2509,7 +2530,7 @@ const fmtDay = t => t ? new Date(t * 1000).toLocaleDateString(window.CT_LOCALE, 
 
 // --- de geldroute: van het startadres tot waar het geld uitkomt ---
 // Waarde van een geldstroom: dollars als bekend, anders BTC/ETH ruw omgerekend; onbekende tokens tellen niet.
-const NATIVE_USD = { BTC: 60000, ETH: 3000 };
+const NATIVE_USD = { BTC: 60000, ETH: 3000, LTC: 80, AVAX: 25, SOL: 150, TRX: 0.25 };
 const edgeVal = e => e.usd || Object.entries(e.assets).reduce((s, [a, v]) => s + (NATIVE_USD[a] || 0) * v, 0);
 function moneyRoutes(max = 5) {
   const seed = nodes.get(current?.seedKey);
@@ -2766,7 +2787,7 @@ function setupSimple() {
 
 // ---------- voorbeeldzaak: verzonnen gegevens, de echte analyse draait erop ----------
 const DEMO = (() => {
-  const idx = { V: 1, A: 2, W1: 3, W2: 4, B: 5, C: 6, X: 7, M: 8, E: 9, D: 10 };
+  const idx = { V: 1, A: 2, W1: 3, W2: 4, B: 5, C: 6, X: 7, M: 8, E: 9, D: 10, G: 11 };
   const ad = k => '0xdec0de' + '0'.repeat(32) + idx[k].toString(16).padStart(2, '0');
   const base = Date.UTC(2026, 9, 1, 9, 0) / 1000;
   const at = (day, min = 0) => base + day * 86400 + min * 60;
@@ -2782,6 +2803,8 @@ const DEMO = (() => {
   add('B', 'C', 2.5, 'ETH', at(8)); add('B', 'C', 7000, 'USDT', at(8, 10));
   add('C', 'X', 2.5, 'ETH', at(8, 70)); add('C', 'X', 7000, 'USDT', at(8, 75));
   add('B', 'D', 0.7, 'ETH', at(9)); add('D', 'M', 0.7, 'ETH', at(9, 45));
+  // Wegwerpadres G: eerst een beetje ETH voor transactiekosten van B, daarna USDT door naar hetzelfde stortingsadres C.
+  add('B', 'G', 0.004, 'ETH', at(7, 120)); add('B', 'G', 1500, 'USDT', at(7, 150)); add('G', 'C', 1500, 'USDT', at(7, 200)); add('C', 'X', 1500, 'USDT', at(7, 260));
   const meta = {
     [ad('X')]: { tags: ['Voorbeeld-Exchange: Hot Wallet (fictief)'] },
     [ad('E')]: { tags: ['Voorbeeld-Exchange: Inkoop (fictief)'] },
@@ -3002,7 +3025,7 @@ async function checkWatches(manual = false) {
   let changed = 0;
   for (const w of l) {
     try {
-      const sig = await watchSig(w.chain, w.addr);
+      const sig = await sigOf(w);
       if (w.sig && sig && sig !== w.sig) { w.changed = true; w.lastChange = Date.now(); changed++; }
       if (sig) w.sig = sig;
       w.lastCheck = Date.now();
@@ -3024,7 +3047,7 @@ function renderWatchBanner() {
 function renderWatches() {
   const l = watch.get();
   $('#watchList').innerHTML = l.map((w, i) => `<div class="xrow ${w.changed ? 'wnew' : ''}">
-      <div class="xrow-top"><b>${esc(w.label || short(w.addr))}</b><span class="muted small">${esc(CHAIN_NAME[w.chain] || w.chain)}</span>${w.changed ? '<span class="tag high">NIEUW</span>' : ''}</div>
+      <div class="xrow-top"><b>${w.members ? '👛 ' : ''}${esc(w.label || short(w.addr))}</b><span class="muted small">${esc(CHAIN_NAME[w.chain] || w.chain)}</span>${w.changed ? '<span class="tag high">NIEUW</span>' : ''}</div>
       <div class="xrow-sub muted">${w.changed ? `Nieuwe beweging gezien op ${new Date(w.lastChange).toLocaleString(window.CT_LOCALE, { dateStyle: 'short', timeStyle: 'short' })}` : 'Geen nieuwe beweging'} · laatst gecontroleerd ${w.lastCheck ? new Date(w.lastCheck).toLocaleString(window.CT_LOCALE, { dateStyle: 'short', timeStyle: 'short' }) : 'nog niet'}${w.caseName ? ' · ' + esc(w.caseName) : ''}</div>
       <div class="lbtns"><button type="button" class="ghost" data-wopen="${i}">Bekijk</button><button type="button" class="ghost" data-wdel="${i}">Stop met volgen</button></div></div>`).join('')
     || '<p class="muted">Je volgt nog geen adressen. Open een adres en tik op "🔔 Volg dit adres".</p>';
@@ -3041,6 +3064,21 @@ function openWatch(i) {
   if (n) { n.data = null; n.loadTried = false; }
   $('#watchDlg').close();
   openAddr(w.chain, w.addr);
+  if (w.members) {
+    // Wallet bijwerken: na het opnieuw laden kan de wallet nieuwe adressen hebben gekregen.
+    for (const a of w.members) { const m = nodes.get(keyOf(w.chain, a)) || ghosts.get(keyOf(w.chain, a)); if (m) { m.data = null; m.loadTried = false; } }
+    setTimeout(() => {
+      invalidateClusters();
+      const c = clusterOf(keyOf(w.chain, w.addr));
+      if (!c || c.members.length <= w.members.length) return;
+      const l2 = watch.get(), e = l2.find(x => x.members && x.addr === w.addr);
+      if (!e) return;
+      const added = c.members.length - e.members.length;
+      e.members = c.members.map(k => k.split(':')[1]).slice(0, 20);
+      watch.set(l2);
+      setStatus(`De wallet heeft ${added} nieuw(e) adres(sen); de tracker volgt ze nu ook.`);
+    }, 8000);
+  }
 }
 
 // ---------- rondleiding (gebruikt de voorbeeldzaak) ----------
@@ -3097,6 +3135,7 @@ async function runTour() {
   if (tour.on) return;
   tour.on = true;
   tour.voice = !!$('#tourVoice')?.checked;
+  $('#formBox').open = true;
   hideDetail();
   demoMode = false;
   resetGraph();
@@ -3163,7 +3202,7 @@ function setupFeatures() {
   $('#btnTourEmpty').addEventListener('click', runTour);
   $('#btnTour').addEventListener('click', runTour);
   $('#btnTourStop').addEventListener('click', stopTour);
-  $('#btnDemoStop').addEventListener('click', () => { demoMode = false; resetGraph(); render(true); $('#addr').value = ''; updateChainHint(); setStatus(''); renderDemoBanner(); });
+  $('#btnDemoStop').addEventListener('click', () => { demoMode = false; resetGraph(); render(true); $('#formBox').open = true; renderFormSummary(); renderOverview(); $('#addr').value = ''; updateChainHint(); setStatus(''); renderDemoBanner(); });
   // keuze van de EVM-keten
   $('#chainPick').addEventListener('click', ev => {
     const b = ev.target.closest('[data-pick]');
@@ -3263,12 +3302,16 @@ function openSettings() {
   $('#setSol').value = s.solRpc || '';
   $('#setTron').value = s.tronKey || '';
   $('#setLang').value = store.get('chaintrace.lang', 'nl');
+  const cr = clusterRules();
+  $('#clInput').checked = cr.input; $('#clChange').checked = cr.change; $('#clDeposit').checked = cr.deposit; $('#clGas').checked = cr.gas;
   $('#settingsDlg').showModal();
 }
 async function saveSettings() {
   const solRpc = $('#setSol').value.trim(), tron = $('#setTron').value.trim();
   if (solRpc && !/^https:\/\/[^\s]+$/.test(solRpc)) { $('#setMsg').textContent = 'Het Solana-adres moet met https:// beginnen.'; return; }
-  settings.set({ solRpc, tronKey: tron });
+  settings.set({ solRpc, tronKey: tron, cluster: { input: $('#clInput').checked, change: $('#clChange').checked, deposit: $('#clDeposit').checked, gas: $('#clGas').checked } });
+  invalidateClusters();
+  if (nodes.size) { render(true); renderSummary(); refreshView(); }
   for (const k of [...cache.keys()]) if (/trongrid|solana|helius|rpc/i.test(k)) cache.delete(k);
   const lang = $('#setLang').value;
   const langChanged = lang !== store.get('chaintrace.lang', 'nl');
@@ -3301,46 +3344,85 @@ const hasValue = t => !t.dust && (t.usd > 0 || NATIVE.has(t.asset));
 // Als er wél waardevolle overboekingen zijn, laat de rest (tokens zonder koers) weg.
 const valuedOrAll = list => { const v = list.filter(hasValue); return v.length ? v : list.filter(t => !t.dust); };
 
-// ---------- Bitcoin/Litecoin: adressen van dezelfde wallet (common-input heuristiek) ----------
-// Adressen die samen als input in één transactie zitten, zijn (vrijwel altijd) van dezelfde eigenaar.
-const MAX_GROUP = 15; // grotere groepen: mogelijk CoinJoin of exchange-batch, niet samenvoegen
+// ---------- wallets / zelfde beheerder: interne regels (geen externe labels nodig) ----------
+// input:   Bitcoin/Litecoin-adressen die samen als input in één transactie zitten (zelfde sleutelhouder)
+// change:  het wisselgeld-adres van zo'n transactie (zelfde adrestype als de inputs en/of geen rond bedrag)
+// deposit: adressen die op hetzelfde klant-stortingsadres bij een exchange storten (zelfde klant)
+// gas:     een nieuw adres dat eerst een klein bedrag (gas/startgeld) krijgt en daarna tokens doorstuurt
+const MAX_GROUP = 15; // grotere input-groepen: mogelijk CoinJoin of exchange-batch, niet samenvoegen
+const RULE_NL = { input: 'samen als input gebruikt', change: 'wisselgeld van dezelfde wallet', deposit: 'stort op hetzelfde stortingsadres', gas: 'kreeg startgeld (gas) van dit adres' };
+const clusterRules = () => { const c = settings.get().cluster || {}; return { input: c.input !== false, change: c.change !== false, deposit: c.deposit !== false, gas: c.gas !== false }; };
+// Slachtoffers (en mogelijke slachtoffers) nooit samenvoegen met andere adressen.
+const victimLike = n => n.seed && current?.role !== 'perp' || n.role === 'victim' || n.hint === 'victim2' || n.upstream || nodeClass(n) === 'victim2';
+const smallNative = t => { const usd = t.usd || (NATIVE_USD[t.asset] || 0) * t.value; return usd > 0 && usd < 60; };
 function walletClusters() {
-  const parent = new Map();
+  const on = clusterRules();
+  const parent = new Map(), why = new Map();
   const find = a => { let r = a; while (parent.get(r) !== r) r = parent.get(r); let x = a; while (parent.get(x) !== r) { const nx = parent.get(x); parent.set(x, r); x = nx; } return r; };
-  const union = (a, b) => { if (!parent.has(a)) parent.set(a, a); if (!parent.has(b)) parent.set(b, b); const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
-  for (const n of [...nodes.values(), ...ghosts.values()]) {
-    if (!isUtxo(n.chain) || !n.data?.coInputs || isEndpoint(n)) continue;
-    for (const g of n.data.coInputs) {
-      if (g.length < 2 || g.length > MAX_GROUP) continue;
-      for (let i = 1; i < g.length; i++) union(n.chain + ':' + g[0], n.chain + ':' + g[i]);
+  const isBad = k => { const n = nodes.get(k) || ghosts.get(k); return !!n && isEndpoint(n); };
+  const union = (a, b, rule) => {
+    if (a === b || isBad(a) || isBad(b)) return;
+    for (const k of [a, b]) if (!parent.has(k)) parent.set(k, k);
+    if (!why.has(b)) why.set(b, { rule, with: a });
+    if (!why.has(a)) why.set(a, { rule, with: b });
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+  const all = [...nodes.values(), ...ghosts.values()].filter(n => n.data);
+  for (const n of all) {
+    if (isEndpoint(n)) continue;
+    const c = n.chain + ':';
+    if (isUtxo(n.chain)) {
+      if (on.input) for (const g of n.data.coInputs || []) if (g.length >= 2 && g.length <= MAX_GROUP) for (let i = 1; i < g.length; i++) union(c + g[0], c + g[i], 'input');
+      if (on.change) for (const [a, ch] of n.data.changeLinks || []) union(c + a, c + ch, 'change');
+    } else if (on.gas && n.data.transfers.length < 500) {
+      // Eerste activiteit = klein bedrag in de eigen munt, daarna tokens doorsturen → financier en adres zijn waarschijnlijk dezelfde beheerder.
+      const tr = n.data.transfers.filter(t => t.time && !t.dust).sort((a, b) => a.time - b.time);
+      const first = tr[0];
+      const funder = first && nodes.get(c + first.from);
+      if (first && funder && !victimLike(funder) && !victimLike(n) && first.to === n.addr && first.asset === SYM[n.chain] && smallNative(first) && !n.data.cursor &&
+          !(funder.data?.txCount > 5000) && tr.some(t => t.from === n.addr && t.asset !== first.asset && t.time >= first.time)) union(c + first.from, n.key, 'gas');
+    }
+  }
+  if (on.deposit) {
+    for (const d of all) {
+      if (!d.depositOf) continue;
+      const senders = [...new Set(d.data.transfers.filter(t => t.to === d.addr && !t.dust && t.from !== d.addr).map(t => d.chain + ':' + t.from))]
+        .filter(k => { const m = nodes.get(k) || ghosts.get(k); return !m || !victimLike(m); });
+      if (senders.length >= 2 && senders.length <= 10) for (let i = 1; i < senders.length; i++) union(senders[0], senders[i], 'deposit');
     }
   }
   const groups = new Map();
   for (const k of parent.keys()) { const r = find(k); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(k); }
   const byKey = new Map();
   for (const members of groups.values()) {
-    if (members.length < 2) continue;
-    // Een "wallet" mag geen exchange/dienst bevatten (die bundelen geld van vele klanten).
-    if (members.some(k => { const n = nodes.get(k) || ghosts.get(k); return n && isEndpoint(n); })) continue;
+    if (members.length < 2 || members.length > 80) continue;
     const id = 'w:' + members.slice().sort()[0];
-    for (const k of members) byKey.set(k, { id, members });
+    const utxo = isUtxo(members[0].split(':')[0]);
+    const reasons = new Map(members.map(k => [k, why.get(k)]));
+    for (const k of members) byKey.set(k, { id, members, utxo, reasons });
   }
   return byKey;
 }
 let clusterCache = null;
 const clusterOf = key => (clusterCache || (clusterCache = walletClusters())).get(key) || null;
 const invalidateClusters = () => { clusterCache = null; };
+const clusterTitle = c => c.utxo ? `Wallet · ${c.members.length} adressen` : `Zelfde beheerder · ${c.members.length} adressen`;
 
 function clusterHtml(n) {
-  if (!isUtxo(n.chain)) return '';
   const c = clusterOf(n.key);
   if (!c) return '';
   const others = c.members.filter(k => k !== n.key);
   const missing = others.filter(k => !nodes.has(k)).length;
-  return `<div class="wallet-box"><div class="story-h"><b>👛 Zelfde wallet (vermoedelijk): ${c.members.length} adressen</b><button type="button" class="tag help" data-help="cluster">? </button></div>
-    ${others.slice(0, 12).map(k => `<div class="xrow-top">${addrChip(n.chain, k.split(':')[1])}</div>`).join('')}
+  const watched = isWalletWatched(c);
+  return `<div class="wallet-box"><div class="story-h"><b>${c.utxo ? '👛 Zelfde wallet' : '👥 Zelfde beheerder'} (vermoedelijk): ${c.members.length} adressen</b><button type="button" class="tag help" data-help="cluster">?</button></div>
+    ${others.slice(0, 12).map(k => { const r = c.reasons.get(k); return `<div class="wb-row">${addrChip(n.chain, k.split(':')[1])}<small class="muted">${esc(RULE_NL[r?.rule] || '')}</small></div>`; }).join('')}
     ${others.length > 12 ? `<p class="hint">… en nog ${others.length - 12}</p>` : ''}
-    ${missing ? `<button type="button" class="ghost wide" data-act="wallet">Hele wallet in het web zetten (${missing} erbij)</button>` : ''}</div>`;
+    <div class="wb-actions">
+      ${missing ? `<button type="button" class="ghost" data-act="wallet">Hele wallet in het web (${missing} erbij)</button>` : ''}
+      <button type="button" class="ghost" data-act="walletfollow">Volg het geld van de hele wallet</button>
+      <button type="button" class="ghost ${watched ? 'watching' : ''}" data-act="walletwatch">${watched ? '🔕 Wallet niet meer volgen' : '🔔 Volg deze wallet'}</button>
+    </div></div>`;
 }
 function addWalletToGraph(n) {
   const c = clusterOf(n.key);
@@ -3352,6 +3434,25 @@ function addWalletToGraph(n) {
   render(true);
   renderSummary();
 }
+async function followWallet(n) {
+  addWalletToGraph(n);
+  const c = clusterOf(n.key);
+  if (!c) return;
+  stopped = false;
+  setBusy(true);
+  current.opts.maxNodes = Math.max(current.opts.maxNodes, nodes.size + c.members.length * current.opts.fanout);
+  for (const k of c.members) {
+    if (stopped) break;
+    const m = nodes.get(k);
+    if (!m) continue;
+    m.expanded = false;
+    await expand(m, m.depth || 0, 'out');
+  }
+  setBusy(false);
+  render(true);
+  renderSummary();
+  setStatus(`Geld van ${c.members.length} wallet-adressen gevolgd: ${nodes.size} adressen, ${edges.size} geldstromen.`);
+}
 // Wallets als groepen in het web (Cytoscape compound nodes).
 function syncWalletGroups() {
   invalidateClusters();
@@ -3362,9 +3463,14 @@ function syncWalletGroups() {
     const inGraph = c.members.filter(k => nodes.has(k));
     if (inGraph.length < 2) continue;
     want.set(n.key, c.id);
-    if (!want.has(c.id)) want.set(c.id, tr(`Wallet · ${c.members.length} adressen`));
+    if (!want.has(c.id)) want.set(c.id, tr(clusterTitle(c)));
   }
-  for (const [k, v] of want) if (k.startsWith('w:') && cy.getElementById(k).empty()) cy.add({ group: 'nodes', data: { id: k, label: v, wallet: true, color: '#4ea1ff', size: 0 } });
+  for (const [k, v] of want) {
+    if (!k.startsWith('w:')) continue;
+    const el = cy.getElementById(k);
+    if (el.empty()) cy.add({ group: 'nodes', data: { id: k, label: v, wallet: true, color: '#4ea1ff', size: 0 } });
+    else if (el.data('label') !== v) el.data('label', v);
+  }
   cy.nodes().forEach(el => {
     if (el.data('wallet')) return;
     const p = want.get(el.id()) || null;
@@ -3372,6 +3478,34 @@ function syncWalletGroups() {
   });
   cy.nodes('[?wallet]').forEach(el => { if (!want.has(el.id()) || el.children().length < 2) { el.children().move({ parent: null }); el.remove(); } });
 }
+
+// ---------- wallet-tracker ----------
+const isWalletWatched = c => watch.get().some(w => w.members && c.members.some(k => k === keyOf(w.chain, w.addr)));
+async function sigOf(w) {
+  if (!w.members) return watchSig(w.chain, w.addr);
+  const out = [];
+  for (const a of w.members.slice(0, 20)) out.push(await watchSig(w.chain, a).catch(() => ''));
+  // Eén mislukt adres zou een valse "nieuwe beweging" geven: dan deze controle overslaan.
+  if (out.some(x => !x)) throw new Error('niet alle adressen bereikbaar');
+  return out.join(',');
+}
+async function toggleWalletWatch(n) {
+  const c = clusterOf(n.key);
+  if (!c) return;
+  const l = watch.get();
+  const i = l.findIndex(w => w.members && c.members.includes(keyOf(w.chain, w.addr)));
+  if (i >= 0) { l.splice(i, 1); watch.set(l); setStatus('Deze wallet wordt niet meer gevolgd.'); return; }
+  const members = c.members.map(k => k.split(':')[1]).slice(0, 20);
+  const w = { chain: n.chain, addr: n.addr, members, label: `${c.utxo ? 'Wallet' : 'Beheerder'} van ${labelOf(n) || short(n.addr)} (${members.length} adressen)`,
+    caseName: caseById(cases.currentId())?.name || '', added: Date.now(), sig: '', lastCheck: Date.now(), changed: false };
+  setStatus('Wallet wordt vastgelegd…');
+  try { w.sig = await sigOf(w); } catch { /* volgende controle */ }
+  l.push(w);
+  watch.set(l);
+  try { window.AndroidBridge?.watchEnabled?.(); } catch { /* geen melding-rechten */ }
+  setStatus(`Deze wallet (${members.length} adressen) wordt nu gevolgd. Je krijgt een melding als er op één van de adressen geld beweegt.`);
+}
+
 function walletSummary() {
   invalidateClusters();
   const seen = new Set();
@@ -3464,7 +3598,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -3608,7 +3742,50 @@ function setupV20() {
   });
 }
 
+// ---------- UI: ingeklapt formulier en overzichtstegels ----------
+function renderFormSummary() {
+  const seed = current && nodes.get(current.seedKey);
+  const has = !!(seed && nodes.size);
+  $('#formSummaryText').innerHTML = has
+    ? `🔎 <b>${esc(labelOf(seed) || short(seed.addr))}</b><span class="fs-meta">${esc(CHAIN_NAME[seed.chain] || '')} · ${esc(current.role === 'perp' ? 'Dader' : 'Slachtoffer')}</span>`
+    : '🔎 <b>Nieuw onderzoek</b>';
+  $('#formSummaryHint').textContent = has ? 'Wijzigen' : '';
+  $('#formBox').classList.toggle('has-case', has);
+}
+function renderOverview() {
+  const box = $('#overview');
+  if (!current || !nodes.size) { box.hidden = true; return; }
+  const all = [...nodes.values()];
+  const sus = all.filter(n => ['perp', 'suspect', 'sanction'].includes(nodeClass(n))).length;
+  const ex = all.filter(n => endKind(n) === 'exchange').length;
+  const dep = all.filter(n => n.depositOf).length;
+  const ws = walletSummary();
+  const vic = origins.starts.size;
+  const tiles = [
+    ['addr', '🕸', nodes.size, 'adressen', ''],
+    ['sus', '⚠️', sus, 'verdacht', sus ? 'warn' : ''],
+    ['ex', '🏦', ex, 'exchanges', ex ? 'good' : ''],
+    ['dep', '📥', dep, 'stortingsadressen', dep ? 'good' : ''],
+    ['wallet', '👛', ws.wallets, 'wallets', ''],
+    ['vic', '👤', vic, 'mogelijke slachtoffers', '']
+  ];
+  box.innerHTML = tiles.map(([k, ic, v, l, cls]) => `<button type="button" class="ov-tile ${cls}" data-ov="${k}"><span class="ov-ic">${ic}</span><b>${v}</b><span class="ov-l">${l}</span></button>`).join('');
+  box.hidden = false;
+}
+function onOverview(k) {
+  const open = (sel, scroll = true) => { const d = $(sel); if (!d || d.hidden) return; d.open = true; if (scroll) d.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+  if (k === 'addr' || k === 'wallet') { setTab('graph'); if (cy) cy.fit(undefined, 40); if (isMobile()) return; }
+  if (k === 'sus') open('#findingsBox');
+  if (k === 'ex' || k === 'dep') open('#routeBox');
+  if (k === 'vic') open('#origins');
+  if (k === 'wallet') { const n = [...nodes.values()].find(x => clusterOf(x.key)); if (n) openNode(n); }
+}
+function setupUI21() {
+  $('#overview').addEventListener('click', ev => { const b = ev.target.closest('[data-ov]'); if (b) onOverview(b.dataset.ov); });
+  renderFormSummary();
+}
+
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { evidenceDossier, sha256Hex, tronHexToB58, routeEdgeKeys, get cy() { return cy; }, walletSummary, clusterOf, labelOf, idb, importCaseFile, cyWallets: () => cy ? cy.nodes('[?wallet]').length : 0, extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { followWallet, toggleWalletWatch, renderOverview, evidenceDossier, sha256Hex, tronHexToB58, routeEdgeKeys, get cy() { return cy; }, walletSummary, clusterOf, labelOf, idb, importCaseFile, cyWallets: () => cy ? cy.nodes('[?wallet]').length : 0, extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();
