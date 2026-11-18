@@ -376,7 +376,20 @@ const PDF_EXTRA = {
   'Dit rapport is automatisch gemaakt met ChainTrace (open source) op basis van openbare blockchaingegevens (mempool.space, Blockscout, TronGrid) en openbare lijsten (OFAC, ScamSniffer, GraphSense, Ransomwhere, Forta, Etherscan-labels, Tether-blacklist). De beoordelingen "verdacht", "mogelijk slachtoffer" en "exchange" zijn aanwijzingen op basis van patronen en labels, geen bewijs. Controleer transacties altijd met de transactie-hash in een block explorer. Per adres zijn alleen de meest recente transacties onderzocht.':
     'This report was generated automatically with ChainTrace (open source) from public blockchain data (mempool.space, Blockscout, TronGrid) and public lists (OFAC, ScamSniffer, GraphSense, Ransomwhere, Forta, Etherscan labels, Tether blacklist). The assessments "suspicious", "possible victim" and "exchange" are indications based on patterns and labels, not proof. Always verify transactions with the transaction hash in a block explorer. Only the most recent transactions per address were examined.',
   'Stap': 'Hop', 'Verstuurd': 'Sent', 'Eerste betaling': 'First payment', 'Tijdstip': 'Time', 'Naar wallet': 'To wallet', 'Bedrag': 'Amount', 'Transactie-hash': 'Transaction hash',
-  'Naar (exchange)': 'To (exchange)', 'Exchange / dienst': 'Exchange / service'
+  'Naar (exchange)': 'To (exchange)', 'Exchange / dienst': 'Exchange / service',
+  // v2.0
+  'Tijdlijn': 'Timeline', 'alleen de geldroute': 'money route only', 'Nog geen geldstromen.': 'No money flows yet.', 'route': 'route',
+  'Alleen geld volgen dat ná de storting vertrok': 'Only follow money that left after the deposit',
+  'de exchange': 'the exchange', 'Stortingsadres': 'Deposit address',
+  'Bij een exchange krijgt elke klant een eigen stortingsadres. Wat daar binnenkomt, zet de exchange door naar een groot verzameladres (hot wallet). Een adres dat bijna al zijn geld naar één exchange doorstuurt, is daarom meestal het stortingsadres van één klant. Met dit adres kan de exchange de klant direct vinden.':
+    'At an exchange every customer gets their own deposit address. Whatever arrives there is swept by the exchange to a large collection address (hot wallet). An address that forwards almost all its money to one exchange is therefore usually the deposit address of one customer. With this address the exchange can find the customer directly.',
+  'Verantwoording en controle': 'Accountability and verification',
+  'Wie het bestand later controleert (bijv. met "sha256sum" of "certutil -hashfile <bestand> SHA256"), moet exact deze code krijgen. Een andere code betekent dat het bestand is gewijzigd.':
+    'Anyone verifying the file later (e.g. with "sha256sum" or "certutil -hashfile <file> SHA256") must get exactly this code. A different code means the file has been changed.',
+  'Programma': 'Program', 'Rapport gemaakt (UTC)': 'Report created (UTC)', 'Instellingen': 'Settings', 'Tijdvolgorde': 'Time order', 'aan': 'on', 'uit': 'off',
+  'Alleen geld gevolgd dat vertrok nadat het op het adres binnenkwam.': 'Only money that left after it arrived at the address was followed.',
+  'Uit: alle uitgaande betalingen gevolgd.': 'Off: all outgoing payments followed.',
+  'Opgehaald (UTC)': 'Fetched (UTC)', 'Geladen': 'Loaded', 'Volledig?': 'Complete?', 'nee, alleen recentste': 'no, most recent only', 'ja': 'yes', 'voorbeeldgegevens': 'example data'
 };
 patterns.push(
   ['{#0} adressen, {#1} geldstromen', '{0} addresses, {1} money flows'],
@@ -386,6 +399,14 @@ patterns.push(
   ['Startwallets - mogelijke slachtoffers of geldbronnen ({#0})', 'Start wallets - possible victims or sources of funds ({0})'],
   ['Uitbetaling via exchanges - cash-out ({#0})', 'Payout via exchanges - cash-out ({0})'],
   ['Startadres - {0}', 'Start address - {0}'], ['Pagina {#0} van {#1}', 'Page {0} of {1}'], ['Wallet {#0} ({#1})', 'Wallet {0} ({1})'],
+  ['{#0} betaling', '{0} payment'], ['{#0} betalingen', '{0} payments'], ['{#0} betalingen (eerste 600 getoond)', '{0} payments (first 600 shown)'],
+  ['Stortingsadres van een klant bij {0} ({#1}% doorgestuurd)', 'Customer deposit address at {0} ({1}% forwarded)'], ['Stortingsadres bij {0}', 'Deposit address at {0}'],
+  ['Dit is waarschijnlijk het persoonlijke stortingsadres van één klant bij {0}. Met dit adres kan de exchange de klant direct vinden: zet het in de brief.', 'This is probably the personal deposit address of one customer at {0}. With this address the exchange can find the customer directly: put it in the letter.'],
+  ['{#0} stortingsadres(sen) van klanten bij een exchange gevonden: {1}. Dit zijn de sterkste aanknopingspunten voor de brief aan de exchange.', '{0} customer deposit address(es) at an exchange found: {1}. These are the strongest leads for the letter to the exchange.'],
+  ['Tijdlijn van de geldroute ({#0})', 'Timeline of the money route ({0})'], ['Bronnen per adres ({#0})', 'Sources per address ({0})'],
+  ['Bij dit rapport hoort het dossierbestand "{0}" met alle adressen, geldstromen en instellingen. De SHA-256-vingerafdruk van dat bestand is:', 'This report comes with the file "{0}" containing all addresses, money flows and settings. The SHA-256 fingerprint of that file is:'],
+  ['stappen {0}, tegenpartijen {1}, max. adressen {2}, tijdvolgorde {3}', 'hops {0}, counterparties {1}, max. addresses {2}, time order {3}'],
+  ['PDF-rapport en dossierbestand opgeslagen ({#0} pagina\'s).', 'PDF report and evidence file saved ({0} pages).'],
   ['- {0}', '- {0}'], ['{#0}. {1}', '{0}. {1}'], ['{#0}. {1}: {2}', '{0}. {1}: {2}']
 );
 Object.assign(exact, PDF_EXTRA);

@@ -161,7 +161,7 @@ async function loadLists(chain) {
 }
 
 // ---------- ketenspecifiek ophalen → genormaliseerde transfers ----------
-async function fetchBtc(addr, chain = 'btc') {
+async function fetchBtc(addr, chain = 'btc', pages = 2) {
   const B = API[chain];
   const [info, txs] = await Promise.all([
     getData(`${B}/address/${addr}`),
@@ -170,9 +170,11 @@ async function fetchBtc(addr, chain = 'btc') {
   let all = txs || [];
   const conf = all.filter(t => t.status?.confirmed);
   let cursor = conf.length >= 25 ? { last: conf[conf.length - 1].txid } : null;
-  if (cursor) {
+  for (let p = 1; p < pages && cursor; p++) {
     const more = await getData(`${B}/address/${addr}/txs/chain/${cursor.last}`).catch(() => null);
-    if (more) { all = all.concat(more); cursor = more.length >= 25 ? { last: more[more.length - 1].txid } : null; }
+    if (!more) break;
+    all = all.concat(more);
+    cursor = more.length >= 25 ? { last: more[more.length - 1].txid } : null;
   }
   const { transfers, peelCount, coInputs } = parseBtcTxs(addr, all, SYM[chain]);
   const cs = info?.chain_stats;
@@ -209,13 +211,18 @@ function parseBtcTxs(addr, all, sym = 'BTC') {
 
 async function fetchEvm(chain, addr) {
   const B = API[chain];
-  const [info, counters, txs, tts] = await Promise.all([
+  // Interne overboekingen zijn optioneel: bij zeer drukke adressen kan die API traag zijn.
+  const internal = Promise.race([getData(`${B}/addresses/${addr}/internal-transactions`, false, 1).catch(() => null), sleep(4000).then(() => null)]);
+  const [info, counters, txs, tts, its] = await Promise.all([
     getData(`${B}/addresses/${addr}`, false, 2).catch(() => null),
     getData(`${B}/addresses/${addr}/counters`, false, 2).catch(() => null),
     getData(`${B}/addresses/${addr}/transactions`),
-    getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20`)
+    getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20`),
+    internal
   ]);
   const page = parseEvmPage(txs, tts, info);
+  page.transfers.push(...parseInternal(its?.items));
+  if (its?.next_page_params) page.cursor = { ...(page.cursor || {}), it: its.next_page_params };
   const txCount = Number(counters?.transactions_count || 0) + Number(counters?.token_transfers_count || 0);
   return {
     ...page, txCount: txCount || null,
@@ -269,10 +276,11 @@ function parseEvmPage(txs, tts, info) {
   return { transfers, meta, cursor };
 }
 
-async function fetchTron(addr, fp) {
-  const [r, acc] = await Promise.all([
-    getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200${fp ? '&fingerprint=' + encodeURIComponent(fp) : ''}`),
-    fp ? null : getData(`${API.tron}/v1/accounts/${addr}`, false, 2).catch(() => null)
+async function fetchTron(addr, fp, fpTrx, more = false) {
+  const [r, acc, nat] = await Promise.all([
+    more && !fp ? null : getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200${fp ? '&fingerprint=' + encodeURIComponent(fp) : ''}`),
+    more ? null : getData(`${API.tron}/v1/accounts/${addr}`, false, 2).catch(() => null),
+    more && !fpTrx ? null : fetchTronNative(addr, fpTrx)
   ]);
   const a = acc?.data?.[0];
   let balance = null;
@@ -292,14 +300,16 @@ async function fetchTron(addr, fp) {
       dust: v === 0 || (!real && /^(USDT|USDC|TUSD)$/i.test(sym))
     };
   });
-  return { transfers, meta: {}, txCount: null, balance, cursor: r?.meta?.fingerprint ? { fp: r.meta.fingerprint } : null };
+  transfers.push(...(nat?.transfers || []));
+  const cur = { fp: r?.meta?.fingerprint || null, fpTrx: nat?.fp || null };
+  return { transfers, meta: {}, txCount: null, balance, cursor: cur.fp || cur.fpTrx ? cur : null };
 }
 
 const despam = d => { for (const t of d.transfers) if (t.value > 1e12) { t.dust = true; t.usd = null; } return d; };
 
-async function fetchAddr(chain, addr) {
+async function fetchAddr(chain, addr, opts = {}) {
   if (demoMode || isDemoAddr(addr)) return demoData(addr);
-  const d = isUtxo(chain) ? await fetchBtc(addr, chain) : isBlockscout(chain) ? await fetchEvm(chain, addr)
+  const d = isUtxo(chain) ? await fetchBtc(addr, chain, opts.pages || 2) : isBlockscout(chain) ? await fetchEvm(chain, addr)
     : chain === 'avax' ? await fetchRoutescan(chain, addr) : chain === 'zksync' ? await fetchZksync(addr)
     : chain === 'sol' ? await fetchSol(addr) : await fetchTron(addr);
   // Absurde bedragen (bv. 2^256-"transfers" van nep-tokens) als spam behandelen.
@@ -319,13 +329,17 @@ async function fetchMore(chain, addr, cursor) {
   if (isEvm(chain)) {
     const B = API[chain];
     const qs = p => Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v ?? '')}`).join('&');
-    const [txs, tts] = await Promise.all([
+    const [txs, tts, its] = await Promise.all([
       cursor.tx ? getData(`${B}/addresses/${addr}/transactions?${qs(cursor.tx)}`) : null,
-      cursor.tt ? getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20&${qs(cursor.tt)}`) : null
+      cursor.tt ? getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20&${qs(cursor.tt)}`) : null,
+      cursor.it ? getData(`${B}/addresses/${addr}/internal-transactions?${qs(cursor.it)}`, false, 1).catch(() => null) : null
     ]);
-    return despam(parseEvmPage(txs, tts, null));
+    const page = parseEvmPage(txs, tts, null);
+    page.transfers.push(...parseInternal(its?.items));
+    if (its?.next_page_params) page.cursor = { ...(page.cursor || {}), it: its.next_page_params };
+    return despam(page);
   }
-  const d = await fetchTron(addr, cursor.fp);
+  const d = await fetchTron(addr, cursor.fp, cursor.fpTrx, true);
   return despam(d);
 }
 
@@ -397,11 +411,17 @@ const STABLE_RE = /^(USDT|USDC|USDC\.e|USDT\.e|USDt|DAI|TUSD|BUSD)$/i;
 async function fetchRoutescan(chain, addr, page = 1) {
   const B = API[chain];
   const q = action => `${B}?module=account&action=${action}&address=${addr}&page=${page}&offset=100&sort=desc`;
-  const [txs, tts, bal] = await Promise.all([
+  const [txs, tts, bal, its] = await Promise.all([
     getData(q('txlist')), getData(q('tokentx')),
-    page === 1 ? getData(`${B}?module=account&action=balance&address=${addr}`, false, 2).catch(() => null) : null
+    page === 1 ? getData(`${B}?module=account&action=balance&address=${addr}`, false, 2).catch(() => null) : null,
+    getData(q('txlistinternal'), false, 2).catch(() => null)
   ]);
   const transfers = [];
+  for (const t of rsArr(its)) {
+    const v = Number(t.value) / 1e18;
+    if (!(v > 0) || t.isError === '1' || !t.to) continue;
+    transfers.push({ from: t.from.toLowerCase(), to: t.to.toLowerCase(), value: v, asset: SYM[chain], time: Number(t.timeStamp), txid: t.hash, internal: true });
+  }
   for (const t of rsArr(txs)) {
     const v = Number(t.value) / 1e18;
     if (!(v > 0) || t.isError === '1' || !t.to) continue;
@@ -416,7 +436,7 @@ async function fetchRoutescan(chain, addr, page = 1) {
       usd: real ? v : null, dust: v === 0 || (!real && STABLE_RE.test(sym))
     });
   }
-  const full = rsArr(txs).length >= 100 || rsArr(tts).length >= 100;
+  const full = rsArr(txs).length >= 100 || rsArr(tts).length >= 100 || rsArr(its).length >= 100;
   return {
     transfers, meta: {}, txCount: null, cursor: full ? { page: page + 1 } : null,
     balance: bal?.result != null && /^\d+$/.test(bal.result) ? `${fmt(Number(bal.result) / 1e18)} ${SYM[chain]}` : null
@@ -600,6 +620,7 @@ function labelOf(n) {
   if (dl) return dl.label;
   if (m?.ens) return m.ens;
   if (m?.name) return m.name;
+  if (n.depositOf) { const ex = nodes.get(n.depositOf) || ghosts.get(n.depositOf); const nm = ex && exName(labelOf(ex)); if (nm) return `Stortingsadres bij ${nm}`; }
   return null;
 }
 
@@ -670,6 +691,7 @@ function fullAnalyze(n) {
   if (dust) addFlag(n, 'dust', 'info', `${dust} nul-/nep-tokentransfer(s) ontvangen (poisoning-kenmerk)`);
 }
 
+const timeOrderOn = () => current?.opts?.timeOrder !== false;
 const isEndpoint = n => n.flags.some(f => ['exchange', 'service', 'mixer', 'sanction', 'contract', 'bridge'].includes(f.code));
 
 function fingerprint(chain, a) {
@@ -724,7 +746,9 @@ function mergeMeta(chain, meta) {
 async function loadData(n) {
   if (n.data) return n.data;
   try {
-    n.data = await fetchAddr(n.chain, n.addr);
+    n.data = await fetchAddr(n.chain, n.addr, { pages: n.seed ? 4 : 2 });
+    n.data.fetchedAt = Date.now();
+    n.data.source = demoMode || isDemoAddr(n.addr) ? 'voorbeeldgegevens' : sourceOf(n.chain);
   } catch (err) {
     if (err.name !== 'AbortError') addFlag(n, 'error', 'info', 'Ophalen mislukt: ' + err.message);
     return null;
@@ -751,6 +775,8 @@ async function expand(n, depth, dir) {
     else if (t.to === n.addr && t.from !== n.addr) { d = 'in'; cp = t.from; }
     else continue;
     if (dir !== 'both' && d !== dir) continue;
+    // Alleen geld volgen dat vertrok nadat het geld hier binnenkwam (10 min. speling voor bloktijden).
+    if (d === 'out' && timeOrderOn() && n.minTime && t.time < n.minTime - 600) continue;
     const k = d + '|' + cp;
     const a = agg.get(k) || { d, cp, rank: 0, count: 0, dustOnly: true, list: [] };
     a.rank += t.usd ?? (isUtxo(n.chain) ? t.value : 0);
@@ -774,6 +800,10 @@ async function expand(n, depth, dir) {
     const isNew = !nodes.has(keyOf(n.chain, a.cp));
     const cn = getNode(n.chain, a.cp);
     if (isNew) { cn.depth = depth + 1; cn.parent = n.key; }
+    if (a.d === 'out') {
+      const tm = Math.min(...a.list.filter(t => !t.dust).map(t => t.time || Infinity));
+      if (isFinite(tm)) cn.minTime = cn.minTime ? Math.min(cn.minTime, tm) : tm;
+    }
     for (const t of a.list) if (!t.dust || lookSet.has(a.cp)) addEdge(n.chain, t.from, t.to, t);
     lightAnalyze(cn);
     if (!cn.role) {
@@ -889,6 +919,8 @@ async function originStep({ n, hop, child }, root, depth, fanIn, seen, sent, lim
   const agg = new Map();
   for (const t of d.transfers) {
     if (t.to !== n.addr || t.from === n.addr || t.dust) continue;
+    // Herkomst: alleen geld dat binnenkwam vóórdat dit adres doorstuurde naar de volgende stap.
+    if (timeOrderOn() && n.maxTime && t.time > n.maxTime + 600) continue;
     // Alleen geld met waarde volgen: onbekende tokens zonder koers zijn meestal spam/airdrops.
     if (!isUtxo(n.chain) && t.usd == null) continue;
     const a = agg.get(t.from) || { cp: t.from, rank: 0, list: [] };
@@ -905,6 +937,7 @@ async function originStep({ n, hop, child }, root, depth, fanIn, seen, sent, lim
     const isNew = !nodes.has(keyOf(n.chain, a.cp));
     const cn = getNode(n.chain, a.cp);
     if (isNew) { cn.depth = hop + 1; cn.parent = n.key; cn.upstream = true; }
+    { const tm = Math.max(...a.list.map(t => t.time || 0)); if (tm) cn.maxTime = Math.max(cn.maxTime || 0, tm); }
     for (const t of a.list) addEdge(n.chain, t.from, t.to, t);
     lightAnalyze(cn);
     if (seen.has(cn.key)) continue;
@@ -1050,6 +1083,7 @@ function scheduleRender() {
 
 function render(final) {
   if (!cy) initCy();
+  detectDeposits();
   $('#empty').hidden = nodes.size > 0;
   const maxUsd = Math.max(1, ...[...edges.values()].map(e => e.usd || Object.values(e.assets)[0] || 0));
   cy.batch(() => {
@@ -1087,6 +1121,7 @@ function render(final) {
   $('#findingsBox').hidden = nodes.size === 0;
   renderOrigins();
   if (current) renderRoutes();
+  renderTimeline();
 }
 
 let graphStale = false;
@@ -1889,6 +1924,8 @@ function summaryLines() {
   if (look.length) out.push({ cls: 'warn', text: `${look.length} adres(sen) lijken sterk op een ander adres: mogelijk "address poisoning".` });
   const before = all.filter(n => n.flags.some(f => f.code === 'seenbefore'));
   if (before.length) out.push({ cls: 'warn', text: `${before.length} adres(sen) kwamen al voor in een eerder onderzoek op dit apparaat.` });
+  const deps = [...nodes.values()].filter(n => n.depositOf);
+  if (deps.length) out.push({ cls: 'good', text: `${deps.length} stortingsadres(sen) van klanten bij een exchange gevonden: ${nameList(deps.map(n => labelOf(n) || short(n.addr)))}. Dit zijn de sterkste aanknopingspunten voor de brief aan de exchange.` });
   const ws = walletSummary();
   if (ws.wallets) out.push({ text: `${ws.addrs} adressen zijn samengevoegd tot ${ws.wallets} wallet(s): ze werden samen als bron gebruikt, dus vrijwel zeker dezelfde eigenaar.` });
   if (origins.starts.size) out.push({ text: `${origins.starts.size} startwallet(s) gevonden waar geld vandaan kwam${current.role === 'perp' ? ': mogelijke andere slachtoffers' : ''}.` });
@@ -2068,6 +2105,19 @@ async function exportPdf() {
       y += 3;
     }
 
+    // Tijdlijn van de geldroute (chronologisch)
+    const rk = routeEdgeKeys();
+    const tl = [];
+    for (const e of edges.values()) if (rk.has(e.key)) for (const t of e.txs) tl.push({ t, e });
+    if (tl.length) {
+      tl.sort((a, b) => (a.t.time || 0) - (b.t.time || 0));
+      heading(`Tijdlijn van de geldroute (${tl.length})`);
+      table(['Tijdstip', 'Van', 'Naar', 'Bedrag', 'Transactie-hash'], tl.slice(0, 300).map(({ t, e }) => [
+        utc(t.time), `${name(nodes.get(e.source)) ? name(nodes.get(e.source)) + '\n' : ''}${nodes.get(e.source).addr}`,
+        `${name(nodes.get(e.target)) ? name(nodes.get(e.target)) + '\n' : ''}${nodes.get(e.target).addr}`, `${fmt(t.value)} ${t.asset}`, t.txid
+      ]), { 0: { cellWidth: 24 }, 1: mono, 2: mono, 3: { cellWidth: 22 }, 4: mono });
+    }
+
     heading('Vervolgstappen');
     pat.steps.forEach((st, i) => para(`${i + 1}.  ${st}`));
     y += 3;
@@ -2075,15 +2125,37 @@ async function exportPdf() {
     heading('Toelichting');
     para('Dit rapport is automatisch gemaakt met ChainTrace (open source) op basis van openbare blockchaingegevens (mempool.space, Blockscout, TronGrid) en openbare lijsten (OFAC, ScamSniffer, GraphSense, Ransomwhere, Forta, Etherscan-labels, Tether-blacklist). De beoordelingen "verdacht", "mogelijk slachtoffer" en "exchange" zijn aanwijzingen op basis van patronen en labels, geen bewijs. Controleer transacties altijd met de transactie-hash in een block explorer. Per adres zijn alleen de meest recente transacties onderzocht.', 8.5, 90);
 
+    // Verantwoording: waar komen de gegevens vandaan en hoe controleer je dat er niets is veranderd?
+    const ev = evidenceDossier();
+    const evText = JSON.stringify(ev, null, 2);
+    const hash = await sha256Hex(evText);
+    const evName = `chaintrace-dossier-${hash.slice(0, 12)}.json`;
+    heading('Verantwoording en controle');
+    para(`Bij dit rapport hoort het dossierbestand "${evName}" met alle adressen, geldstromen en instellingen. De SHA-256-vingerafdruk van dat bestand is:`, 8.5, 60);
+    doc.setFont('courier', 'normal'); doc.setFontSize(8); doc.setTextColor(20); room(6); doc.text(hash, M, y); y += 6;
+    para('Wie het bestand later controleert (bijv. met "sha256sum" of "certutil -hashfile <bestand> SHA256"), moet exact deze code krijgen. Een andere code betekent dat het bestand is gewijzigd.', 8.5, 90);
+    table(['Gegeven', 'Waarde'], [
+      ['Programma', `ChainTrace ${APP_VERSION} (open source)`],
+      ['Rapport gemaakt (UTC)', new Date().toISOString().slice(0, 16).replace('T', ' ')],
+      ['Instellingen', `stappen ${current.opts.depth}, tegenpartijen ${current.opts.fanout}, max. adressen ${current.opts.maxNodes}, tijdvolgorde ${timeOrderOn() ? 'aan' : 'uit'}`],
+      ['Tijdvolgorde', timeOrderOn() ? 'Alleen geld gevolgd dat vertrok nadat het op het adres binnenkwam.' : 'Uit: alle uitgaande betalingen gevolgd.']
+    ], { 0: { cellWidth: 42, fontStyle: 'bold' } });
+    heading(`Bronnen per adres (${ev.provenance.length})`);
+    table(['Adres', 'Keten', 'Bron', 'Opgehaald (UTC)', 'Geladen', 'Volledig?'], ev.provenance.map(p => [
+      p.address, CHAIN_NAME[p.chain] || p.chain, p.source, p.fetchedAt ? p.fetchedAt.slice(0, 16).replace('T', ' ') : '-', String(p.transfersLoaded),
+      p.moreHistoryAvailable ? 'nee, alleen recentste' : 'ja'
+    ]), { 0: { ...mono, cellWidth: 52 }, 1: { cellWidth: 18 }, 2: { cellWidth: 34 }, 3: { cellWidth: 24 }, 4: { cellWidth: 14 } });
+
     const pages = doc.getNumberOfPages();
     for (let i = 1; i <= pages; i++) {
       doc.setPage(i);
       doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(140);
-      doc.text(S(`ChainTrace  |  ${short(seed.addr)}  |  ${new Date().toLocaleDateString(window.CT_LOCALE)}`), M, 291);
-      doc.text(`Pagina ${i} van ${pages}`, W - M, 291, { align: 'right' });
+      doc.text(S(`ChainTrace ${APP_VERSION}  |  ${short(seed.addr)}  |  ${new Date().toLocaleDateString(window.CT_LOCALE)}  |  SHA-256 ${hash.slice(0, 12)}…`), M, 291);
+      doc.text(S(`Pagina ${i} van ${pages}`), W - M, 291, { align: 'right' });
     }
     saveFile(`chaintrace-rapport-${stamp()}.pdf`, 'application/pdf', doc.output('datauristring'), true);
-    setStatus(`PDF-rapport opgeslagen (${pages} pagina's).`);
+    saveFile(evName, 'application/json', evText, false);
+    setStatus(`PDF-rapport en dossierbestand opgeslagen (${pages} pagina's).`);
     return doc;
   } catch (err) {
     setStatus('PDF maken mislukt: ' + err.message, true);
@@ -2147,7 +2219,7 @@ function setBusy(b) { $('#btnTrace').disabled = b; $('#btnStop').hidden = !b; }
 
 function readOpts() {
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
-  return { depth: clamp($('#depth').value, 1, 4), fanout: clamp($('#fanout').value, 2, 25), maxNodes: clamp($('#maxNodes').value, 10, 300) };
+  return { depth: clamp($('#depth').value, 1, 4), fanout: clamp($('#fanout').value, 2, 25), maxNodes: clamp($('#maxNodes').value, 10, 300), timeOrder: $('#timeOrder').checked };
 }
 
 function updateChainHint() {
@@ -2267,6 +2339,7 @@ function setup() {
   setupSimple();
   setupFeatures();
   setupV19();
+  setupV20();
 
   // Tabbalk (telefoon), zoeken in de verkenner en het kaartje onder in het web.
   document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
@@ -2374,6 +2447,7 @@ const HELP = {
   lookalike: ['Lijkt-op-adres (address poisoning)', 'Oplichters maken een adres dat aan het begin en eind hetzelfde is als een adres dat je vaker gebruikt. Wie dan een adres uit de geschiedenis kopieert, stuurt het geld per ongeluk naar de oplichter. Vergelijk daarom altijd het hele adres.'],
   dust: ['Spam / nul-transacties', 'Overboekingen van 0 of met nepmunten. Vaak bedoeld om een lijkt-op-adres in de geschiedenis van het slachtoffer te zetten.'],
   seenbefore: ['Eerder gezien', 'Dit adres kwam al voor in een ander onderzoek op dit apparaat.'],
+  deposit: ['Stortingsadres', 'Bij een exchange krijgt elke klant een eigen stortingsadres. Wat daar binnenkomt, zet de exchange door naar een groot verzameladres (hot wallet). Een adres dat bijna al zijn geld naar één exchange doorstuurt, is daarom meestal het stortingsadres van één klant. Met dit adres kan de exchange de klant direct vinden.'],
   cluster: ['Zelfde wallet', 'Bij Bitcoin en Litecoin kan één eigenaar veel adressen hebben. Als adressen samen als bron (input) in één transactie worden gebruikt, moet de eigenaar ze allemaal kunnen ondertekenen: ze horen dus vrijwel zeker bij dezelfde wallet. Uitzondering: speciale privacy-transacties (CoinJoin); die voegt de app niet samen.'],
   overlap: ['Komt vaker voor', 'Dit adres komt voor in meerdere onderzoeken van dezelfde zaak. Dat is een belangrijk verband: bijvoorbeeld dezelfde oplichter bij verschillende slachtoffers.'],
   reputation: ['Reputatie', 'De blockchain-verkenner waarschuwt dat dit adres of deze munt niet te vertrouwen is.']
@@ -2422,6 +2496,7 @@ function plainStory(n) {
     if (!outs.length && ins.length && !isEndpoint(n)) out.push('Er is (nog) niets doorgestuurd: het geld staat hier mogelijk nog.');
     if (d.balance && !bal0(d.balance) && !isEndpoint(n)) out.push(`Er staat nu nog ${d.balance} op dit adres.`);
   }
+  if (n.depositOf) { const ex = nodes.get(n.depositOf) || ghosts.get(n.depositOf); out.push(`Dit is waarschijnlijk het persoonlijke stortingsadres van één klant bij ${exName(labelOf(ex)) || 'de exchange'}. Met dit adres kan de exchange de klant direct vinden: zet het in de brief.`); }
   if (has('passthrough')) out.push('Geld bleef hier meestal korter dan een uur: typisch een doorsluisadres van oplichters.');
   if (has('fanin') && !isEndpoint(n)) out.push('Veel verschillende mensen stuurden geld naar dit adres: mogelijk zijn er meer slachtoffers.');
   if (has('startwallet')) out.push('Hier begint het geld voor zover te volgen: mogelijk een ander slachtoffer of de bron van het geld.');
@@ -2508,9 +2583,13 @@ let letterNode = null;
 function letterData(ex) {
   const seed = nodes.get(current?.seedKey);
   const inc = [...edges.values()].filter(e => e.target === ex.key && nodes.has(e.source));
-  const deposits = [...new Set(inc.map(e => e.source).filter(k => k !== seed?.key))].map(k => nodes.get(k).addr);
+  const srcs = [...new Set(inc.map(e => e.source).filter(k => k !== seed?.key))].map(k => nodes.get(k));
+  const deposits = srcs.filter(n => n.depositOf === ex.key).map(n => n.addr);
+  const possible = srcs.filter(n => n.depositOf !== ex.key).map(n => n.addr);
+  // Ook stortingsadressen die nog niet direct aan dit exchange-adres in het web hangen.
+  for (const n of nodes.values()) if (n.depositOf === ex.key && !deposits.includes(n.addr)) deposits.push(n.addr);
   const txs = inc.flatMap(e => e.txs).sort((a, b) => (a.time || 0) - (b.time || 0)).slice(0, 25);
-  return { ex, name: exName(labelOf(ex)) || 'Exchange', seed, deposits, txs };
+  return { ex, name: exName(labelOf(ex)) || 'Exchange', seed, deposits, possible, txs };
 }
 // "Binance: Hot Wallet 14" -> "Binance"
 const exName = s => { if (!s) return ''; const c = s.replace(/\s*([:|(]|\s[–-]\s).*$/, '').replace(/\s*(hot|cold|deposit)?\s*wallet.*$/i, '').replace(/\s+\d+$/, '').trim(); return c || s; };
@@ -2519,6 +2598,7 @@ function letterText(d, f, lang) {
   const num = v => v.toLocaleString(lang === 'nl' ? window.CT_LOCALE : 'en-US', { maximumFractionDigits: 8 });
   const txl = d.txs.map(t => `- ${utc(t.time)} | ${num(t.value)} ${t.asset} | tx ${t.txid}`).join('\n') || '-';
   const dep = d.deposits.map(a => `- ${a}`).join('\n');
+  const pos = d.possible.map(a => `- ${a}`).join('\n');
   const cs = f.caseNo || '[zaaknummer]', nm = f.name || '[naam, organisatie]', ml = f.mail || '[e-mailadres]';
   if (lang === 'nl') return `Onderwerp: Verzoek tot bevriezing van tegoeden en bewaren van gegevens – ${d.name} – zaak ${cs}
 
@@ -2530,7 +2610,7 @@ Blockchain: ${chain}
 Adres van ${current?.role === 'perp' ? 'de vermoedelijke dader' : 'het slachtoffer'}: ${d.seed?.addr || '-'}
 Adres bij ${d.name} dat het geld ontving:
 - ${d.ex.addr}
-${dep ? `Mogelijk stortingsadres (deposit address) van uw klant:\n${dep}\n` : ''}
+${dep ? `Stortingsadres(sen) van uw klant (zeer waarschijnlijk; het geld werd vrijwel volledig naar uw adres doorgezet):\n${dep}\n` : ''}${pos ? `Mogelijk stortingsadres van uw klant:\n${pos}\n` : ''}
 Transacties:
 ${txl}
 
@@ -2554,7 +2634,7 @@ Blockchain: ${chain}
 ${current?.role === 'perp' ? 'Suspect' : 'Victim'} address: ${d.seed?.addr || '-'}
 Address at ${d.name} that received the funds:
 - ${d.ex.addr}
-${dep ? `Possible deposit address(es) of your customer:\n${dep}\n` : ''}
+${dep ? `Deposit address(es) of your customer (very likely; the funds were forwarded almost entirely to your address):\n${dep}\n` : ''}${pos ? `Possible deposit address(es) of your customer:\n${pos}\n` : ''}
 Transactions:
 ${txl}
 
@@ -3383,7 +3463,152 @@ function setupV19() {
   });
 }
 
+// ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
+const APP_VERSION = '2.0';
+
+// Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const tronCache = new Map();
+async function tronHexToB58(hex) {
+  if (!hex) return null;
+  if (tronCache.has(hex)) return tronCache.get(hex);
+  const bytes = new Uint8Array(hex.match(/../g).map(h => parseInt(h, 16)));
+  const h1 = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const h2 = new Uint8Array(await crypto.subtle.digest('SHA-256', h1));
+  const full = new Uint8Array([...bytes, ...h2.slice(0, 4)]);
+  let n = 0n;
+  for (const b of full) n = n * 256n + BigInt(b);
+  let s = '';
+  while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+  for (const b of full) { if (b === 0) s = '1' + s; else break; }
+  tronCache.set(hex, s);
+  return s;
+}
+async function fetchTronNative(addr, fp) {
+  const r = await getData(`${API.tron}/v1/accounts/${addr}/transactions?limit=100&only_confirmed=true${fp ? '&fingerprint=' + encodeURIComponent(fp) : ''}`, false, 3).catch(() => null);
+  const transfers = [];
+  for (const t of r?.data || []) {
+    const c = t.raw_data?.contract?.[0];
+    if (c?.type !== 'TransferContract' || t.ret?.[0]?.contractRet !== 'SUCCESS') continue;
+    const v = c.parameter.value;
+    const from = await tronHexToB58(v.owner_address), to = await tronHexToB58(v.to_address);
+    const trx = Number(v.amount || 0) / 1e6;
+    if (!(trx > 0)) continue;
+    transfers.push({ from, to, value: trx, asset: 'TRX', time: t.block_timestamp / 1000, txid: t.txID, dust: trx < 0.01 });
+  }
+  return { transfers, fp: r?.meta?.fingerprint || null };
+}
+function parseInternal(items) {
+  const out = [];
+  for (const it of items || []) {
+    const v = Number(it.value || 0) / 1e18;
+    if (!(v > 0) || it.success === false || it.error) continue;
+    const f = it.from?.hash?.toLowerCase(), t = it.to?.hash?.toLowerCase();
+    if (!f || !t) continue;
+    out.push({ from: f, to: t, value: v, asset: 'ETH', time: Date.parse(it.timestamp) / 1000, txid: it.transaction_hash, internal: true });
+  }
+  return out;
+}
+
+// ---------- stortingsadressen bij exchanges ----------
+// Een adres dat (vrijwel) al zijn geld doorstuurt naar één exchange-adres is meestal het persoonlijke
+// stortingsadres van één klant: precies het adres waarmee de exchange de klant kan identificeren.
+function detectDeposits() {
+  for (const n of [...nodes.values(), ...ghosts.values()]) {
+    if (!n.data || isEndpoint(n) || n.depositChecked === n.data.transfers.length) continue;
+    n.depositChecked = n.data.transfers.length;
+    const outs = valuedOrAll(n.data.transfers).filter(t => t.from === n.addr && t.to !== n.addr);
+    const ins = n.data.transfers.filter(t => t.to === n.addr && t.from !== n.addr && !t.dust);
+    if (!outs.length || !ins.length) continue;
+    const val = t => t.usd || (NATIVE_USD[t.asset] || 0) * t.value || 1;
+    const by = new Map();
+    for (const t of outs) by.set(t.to, (by.get(t.to) || 0) + val(t));
+    const total = [...by.values()].reduce((a, b) => a + b, 0);
+    const [top, v] = [...by.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (v / total < 0.8) continue;
+    const r = nodes.get(keyOf(n.chain, top)) || peekNode(n.chain, top);
+    if (endKind(r) !== 'exchange') continue;
+    const name = exName(labelOf(r)) || 'een exchange';
+    n.depositOf = r.key;
+    addFlag(n, 'deposit', 'high', `Stortingsadres van een klant bij ${name} (${Math.round(100 * v / total)}% doorgestuurd)`);
+  }
+}
+
+// ---------- tijdlijn ----------
+let timelineOnly = false;
+function routeEdgeKeys() {
+  const s = new Set();
+  for (const r of moneyRoutes(20).routes) for (const e of r.steps) s.add(e.key);
+  return s;
+}
+function renderTimeline() {
+  const box = $('#timeline');
+  if (box.hidden) return;
+  const onRoute = routeEdgeKeys();
+  const rows = [];
+  for (const e of edges.values()) {
+    if (!nodes.has(e.source) || !nodes.has(e.target)) continue;
+    if (timelineOnly && !onRoute.has(e.key)) continue;
+    for (const t of e.txs) rows.push({ ...t, e, route: onRoute.has(e.key) });
+  }
+  rows.sort((a, b) => (a.time || 0) - (b.time || 0));
+  let day = '';
+  const html = rows.slice(0, 600).map(r => {
+    const s = nodes.get(r.e.source), t = nodes.get(r.e.target);
+    const d = fmtDay(r.time);
+    const head = d !== day ? `<div class="tl-day">${esc(d)}</div>` : '';
+    day = d;
+    const time = r.time ? new Date(r.time * 1000).toLocaleTimeString(window.CT_LOCALE, { hour: '2-digit', minute: '2-digit' }) : '';
+    return `${head}<div class="tl-row ${r.route ? 'route' : ''}">
+      <span class="tl-time">${esc(time)}</span>
+      <div class="tl-main">${addrChip(s.chain, s.addr)}<span class="tl-arrow">→</span>${addrChip(t.chain, t.addr)}</div>
+      <div class="tl-sub"><b>${fmt(r.value)} ${esc(r.asset)}</b> <button type="button" class="txlink" data-tx="${esc(r.txid)}" data-chain="${esc(s.chain)}">${esc(short(r.txid))}</button>${r.route ? ' <span class="tag info">route</span>' : ''}</div>
+    </div>`;
+  }).join('');
+  $('#timelineList').innerHTML = html || '<p class="muted">Nog geen geldstromen.</p>';
+  $('#timelineCount').textContent = `${rows.length} betaling${rows.length === 1 ? '' : 'en'}${rows.length > 600 ? ' (eerste 600 getoond)' : ''}`;
+}
+function setGraphView(v) {
+  const tl = v === 'time';
+  $('#timeline').hidden = !tl;
+  $('#cy').style.visibility = tl ? 'hidden' : '';
+  document.querySelector('.legend-wrap').hidden = tl;
+  for (const [id, name] of [['#btnLayoutWeb', 'web'], ['#btnLayoutFlow', 'flow'], ['#btnLayoutTime', 'time']]) $(id).classList.toggle('active', v === name);
+  if (tl) renderTimeline();
+}
+
+// ---------- verantwoording: herkomst van gegevens en controleerbare vingerafdruk ----------
+const SOURCE_NAME = { btc: 'mempool.space', ltc: 'litecoinspace.org', eth: 'eth.blockscout.com', op: 'explorer.optimism.io', tron: 'api.trongrid.io', avax: 'api.routescan.io', zksync: 'block-explorer-api.mainnet.zksync.io', sol: () => new URL(API.sol).host };
+const sourceOf = chain => { const s = SOURCE_NAME[chain]; return typeof s === 'function' ? s() : s; };
+async function sha256Hex(text) {
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function evidenceDossier() {
+  const d = buildDossier();
+  d.app = { name: 'ChainTrace', version: APP_VERSION };
+  d.settings = { ...current?.opts, timeOrder: current?.opts?.timeOrder !== false };
+  d.provenance = [...nodes.values()].filter(n => n.data).map(n => ({
+    address: n.addr, chain: n.chain, source: n.data.source || sourceOf(n.chain), fetchedAt: n.data.fetchedAt ? new Date(n.data.fetchedAt).toISOString() : null,
+    transfersLoaded: n.data.transfers.length, moreHistoryAvailable: !!n.data.cursor
+  }));
+  return d;
+}
+
+function setupV20() {
+  $('#btnLayoutTime').addEventListener('click', () => setGraphView('time'));
+  $('#btnLayoutWeb').addEventListener('click', () => setGraphView('web'));
+  $('#btnLayoutFlow').addEventListener('click', () => setGraphView('flow'));
+  $('#tlOnlyRoute').addEventListener('change', ev => { timelineOnly = ev.target.checked; renderTimeline(); });
+  $('#timelineList').addEventListener('click', ev => {
+    const a = ev.target.closest('[data-addr]'), t = ev.target.closest('[data-tx]');
+    const chain = (a || t)?.closest('.tl-row')?.querySelector('[data-chain]')?.dataset.chain || current?.chain;
+    if (t) openTx(t.dataset.chain || chain, t.dataset.tx);
+    else if (a) openAddr(chain, a.dataset.addr);
+  });
+}
+
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { get cy() { return cy; }, walletSummary, clusterOf, labelOf, idb, importCaseFile, cyWallets: () => cy ? cy.nodes('[?wallet]').length : 0, extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { evidenceDossier, sha256Hex, tronHexToB58, routeEdgeKeys, get cy() { return cy; }, walletSummary, clusterOf, labelOf, idb, importCaseFile, cyWallets: () => cy ? cy.nodes('[?wallet]').length : 0, extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

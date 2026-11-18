@@ -443,3 +443,19 @@ body.big .legend-wrap .legend { max-width: calc((100vw - 20px) / 1.2); }
 .filebtn.center { display: block; text-align: center; cursor: pointer; }
 #settingsDlg .field { margin-bottom: 12px; }
 #settingsDlg input[type=text] { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+
+/* ---- tijdlijn ---- */
+.timeline { position: absolute; inset: 52px 10px 10px 10px; overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px; z-index: 4; }
+.tl-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; position: sticky; top: -10px; background: var(--panel); padding: 6px 0 8px; border-bottom: 1px solid var(--line); margin-bottom: 6px; z-index: 1; }
+.tl-head label { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.tl-day { margin: 12px 0 4px; font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .5px; }
+.tl-row { display: grid; grid-template-columns: 52px 1fr; gap: 2px 10px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.tl-row.route { background: color-mix(in srgb, var(--suspect) 8%, transparent); border-radius: 6px; }
+.tl-time { grid-row: span 2; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 6px; }
+.tl-main { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.tl-main .alink { flex: 0 1 auto; }
+.tl-arrow { color: var(--muted); }
+.tl-sub { font-size: 12px; }
+.adv .row.check input { width: auto; }
+@media (max-width: 820px) { .timeline { inset: 96px 8px 8px 8px; } }
+.timeline .inweb { display: none; }
