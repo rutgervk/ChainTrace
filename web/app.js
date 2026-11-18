@@ -265,7 +265,16 @@ function parseEvmPage(txs, tts, info) {
 }
 
 async function fetchTron(addr, fp) {
-  const r = await getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200${fp ? '&fingerprint=' + encodeURIComponent(fp) : ''}`);
+  const [r, acc] = await Promise.all([
+    getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200${fp ? '&fingerprint=' + encodeURIComponent(fp) : ''}`),
+    fp ? null : getData(`${API.tron}/v1/accounts/${addr}`, false, 2).catch(() => null)
+  ]);
+  const a = acc?.data?.[0];
+  let balance = null;
+  if (a) {
+    const usdt = (a.trc20 || []).map(o => o.TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t).find(Boolean);
+    balance = `${fmt((a.balance || 0) / 1e6)} TRX` + (usdt ? ` + ${fmt(Number(usdt) / 1e6)} USDT` : '');
+  }
   const transfers = (r?.data || []).map(d => {
     const dec = Number(d.token_info?.decimals ?? 6);
     const v = Number(d.value) / 10 ** dec;
@@ -278,13 +287,13 @@ async function fetchTron(addr, fp) {
       dust: v === 0 || (!real && /^(USDT|USDC|TUSD)$/i.test(sym))
     };
   });
-  return { transfers, meta: {}, txCount: null, balance: null, cursor: r?.meta?.fingerprint ? { fp: r.meta.fingerprint } : null };
+  return { transfers, meta: {}, txCount: null, balance, cursor: r?.meta?.fingerprint ? { fp: r.meta.fingerprint } : null };
 }
 
 const despam = d => { for (const t of d.transfers) if (t.value > 1e12) { t.dust = true; t.usd = null; } return d; };
 
 async function fetchAddr(chain, addr) {
-  if (demoMode) return demoData(addr);
+  if (demoMode || isDemoAddr(addr)) return demoData(addr);
   const d = isUtxo(chain) ? await fetchBtc(addr, chain) : isBlockscout(chain) ? await fetchEvm(chain, addr)
     : chain === 'avax' ? await fetchRoutescan(chain, addr) : chain === 'zksync' ? await fetchZksync(addr)
     : chain === 'sol' ? await fetchSol(addr) : await fetchTron(addr);
@@ -328,7 +337,7 @@ async function fetchTx(chain, txid) {
     }
     return { chain, txid, time: transfers[0]?.time || null, confirmed: true, transfers, partial: true };
   };
-  if (demoMode) return known();
+  if (demoMode || /^0xdec0de/.test(txid)) return known();
   if (isUtxo(chain)) {
     const tx = await getData(`${API[chain]}/tx/${txid}`);
     if (!tx) return known();
@@ -1170,7 +1179,8 @@ function openView(v, { replace = false } = {}) {
     nav.stack = nav.stack.slice(0, nav.i + 1);
     nav.stack.push(v);
     nav.i++;
-    try { history.pushState({ ctv: nav.i }, ''); } catch { /* file:// */ }
+    // In de Android-app regelt de terugknop zelf de navigatie (ChainTraceBack); in de browser via de geschiedenis.
+    if (!IN_APP) try { history.pushState({ ctv: nav.i }, ''); } catch { /* file:// */ }
   }
   hidePeek();
   $('#detail').hidden = false;
@@ -1187,22 +1197,38 @@ const curView = () => nav.stack[nav.i];
 const stillCurrent = v => curView() === v && !$('#detail').hidden;
 function refreshView() { if (nav.i >= 0 && !$('#detail').hidden) renderView(); }
 
+const IN_APP = !!window.AndroidBridge;
+let skipPop = false;
 function goBack() {
   if (nav.i <= 0) { closeExplorer(); return; }
-  if (history.state?.ctv === nav.i) history.back();
+  if (!IN_APP && history.state?.ctv === nav.i) history.back();
   else { nav.i--; renderView(); }
 }
 function closeExplorer() {
   const st = history.state?.ctv;
-  if (nav.i >= 0 && st != null && st === nav.i) history.go(-(st + 1));
-  else hideDetail();
+  // Meteen sluiten; de geschiedenis wordt daarna opgeruimd zonder dat die "pop" iets nieuws dichtdoet.
+  hideDetail();
+  if (!IN_APP && st != null) { skipPop = true; history.go(-(st + 1)); }
 }
+// Android-terugknop: eerst wat open staat sluiten, dan pas de app.
+window.ChainTraceBack = () => {
+  const dlg = document.querySelector('dialog[open]');
+  if (dlg) { dlg.close(); return true; }
+  if (tour.on) { stopTour(); return true; }
+  if ($('#moreMenu').open) { $('#moreMenu').open = false; return true; }
+  if ($('#peek') && !$('#peek').hidden) { hidePeek(); return true; }
+  if (nav.i > 0) { nav.i--; renderView(); return true; }
+  if (nav.i === 0) { hideDetail(); return true; }
+  if (isMobile() && document.body.dataset.tab !== 'form') { setTab('form'); return true; }
+  return false;
+};
 function hideDetail() {
   $('#detail').hidden = true;
   nav.stack = []; nav.i = -1;
   if (document.body.dataset.tab === 'detail') setTab(nodes.size ? 'graph' : 'form');
 }
 window.addEventListener('popstate', ev => {
+  if (skipPop) { skipPop = false; return; }
   const i = ev.state?.ctv;
   if (i != null && nav.stack[i]) { nav.i = i; $('#detail').hidden = false; setTab('detail'); renderView(); }
   else hideDetail();
@@ -1615,15 +1641,6 @@ const stamp = () => new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
 function exportJson() {
   const seed = nodes.get(current?.seedKey);
   const dossier = buildDossier();
-  const unused = {
-    tool: 'ChainTrace', version: 1, exported: new Date().toISOString(),
-    case: current && { chain: current.chain, role: current.role, pattern: window.PATTERNS[current.pattern].name, patternKey: current.pattern, seed: seed?.addr, started: current.started },
-    nodes: [...nodes.values()].map(n => ({ key: n.key, chain: n.chain, address: n.addr, label: labelOf(n), role: n.role, classification: nodeClass(n), hop: n.depth, flags: n.flags, seed: !!n.seed, hint: n.hint, parent: n.parent, upstream: !!n.upstream })),
-    edges: [...edges.values()].map(e => ({ ...e, first: e.first === Infinity ? null : e.first })),
-    origins: { rootKey: origins.rootKey, starts: [...origins.starts.values()], cashIn: origins.cashIn },
-    notes,
-    customLabels
-  };
   saveFile(`chaintrace-${short(seed?.addr || 'dossier').replace('…', '_')}-${stamp()}.json`, 'application/json', JSON.stringify(dossier, null, 2), false);
 }
 
@@ -2450,7 +2467,7 @@ function letterData(ex) {
   return { ex, name: exName(labelOf(ex)) || 'Exchange', seed, deposits, txs };
 }
 // "Binance: Hot Wallet 14" -> "Binance"
-const exName = s => { if (!s) return ''; const c = s.replace(/\s*[:|(–-].*$/, '').replace(/\s*(hot|cold|deposit)?\s*wallet.*$/i, '').replace(/\s+\d+$/, '').trim(); return c || s; };
+const exName = s => { if (!s) return ''; const c = s.replace(/\s*([:|(]|\s[–-]\s).*$/, '').replace(/\s*(hot|cold|deposit)?\s*wallet.*$/i, '').replace(/\s+\d+$/, '').trim(); return c || s; };
 function letterText(d, f, lang) {
   const chain = CHAIN_NAME[d.ex.chain];
   const num = v => v.toLocaleString(lang === 'nl' ? 'nl-NL' : 'en-US', { maximumFractionDigits: 8 });
@@ -2650,6 +2667,7 @@ const DEMO = (() => {
   return { victim: ad('V'), scammer: ad('A'), data };
 })();
 let demoMode = false;
+const isDemoAddr = a => /^0xdec0de0{32}/i.test(a || '');
 const demoData = addr => structuredClone(DEMO.data[addr.toLowerCase()] || { transfers: [], meta: {}, txCount: 0, balance: null, cursor: null });
 
 function startDemo() {
@@ -2748,7 +2766,7 @@ function autosave() {
   saveTimer = setTimeout(async () => {
     if (!current || demoMode || current.merged || !nodes.size) return;
     const seed = nodes.get(current.seedKey);
-    if (!seed) return;
+    if (!seed || isDemoAddr(seed.addr)) return;
     let c = caseById(cases.currentId()) || newCase();
     const item = { seedKey: current.seedKey, chain: current.chain, addr: seed.addr, role: current.role, pattern: window.PATTERNS[current.pattern].name,
       title: labelOf(seed) || short(seed.addr), saved: Date.now(), size: nodes.size };
@@ -3099,5 +3117,5 @@ function setupFeatures() {
 
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

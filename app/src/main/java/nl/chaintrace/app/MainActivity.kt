@@ -92,7 +92,10 @@ class MainActivity : ComponentActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) webView.goBack() else finish()
+                // Eerst de webapp laten sluiten wat open staat (venster, verkenner, tab); anders de app sluiten.
+                webView.evaluateJavascript("window.ChainTraceBack ? ChainTraceBack() : false") { handled ->
+                    if (handled != "true") { if (webView.canGoBack()) webView.goBack() else finish() }
+                }
             }
         })
 
