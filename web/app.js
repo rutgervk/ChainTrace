@@ -145,10 +145,21 @@ async function fetchBtc(addr) {
   ]);
   let all = txs || [];
   const conf = all.filter(t => t.status?.confirmed);
-  if (conf.length >= 25) {
-    const more = await getData(`${API.btc}/address/${addr}/txs/chain/${conf[conf.length - 1].txid}`).catch(() => null);
-    if (more) all = all.concat(more);
+  let cursor = conf.length >= 25 ? { last: conf[conf.length - 1].txid } : null;
+  if (cursor) {
+    const more = await getData(`${API.btc}/address/${addr}/txs/chain/${cursor.last}`).catch(() => null);
+    if (more) { all = all.concat(more); cursor = more.length >= 25 ? { last: more[more.length - 1].txid } : null; }
   }
+  const { transfers, peelCount } = parseBtcTxs(addr, all);
+  const cs = info?.chain_stats;
+  return {
+    transfers, peelCount, meta: {}, cursor,
+    txCount: cs?.tx_count ?? all.length,
+    balance: cs ? `${fmt((cs.funded_txo_sum - cs.spent_txo_sum) / 1e8)} BTC` : null
+  };
+}
+
+function parseBtcTxs(addr, all) {
   const transfers = [];
   let peelCount = 0;
   for (const tx of all) {
@@ -167,12 +178,7 @@ async function fetchBtc(addr) {
       if (recv > 0) for (const i of ins) transfers.push({ from: i, to: addr, value: recv / ins.length, asset: 'BTC', time, txid: tx.txid });
     }
   }
-  const cs = info?.chain_stats;
-  return {
-    transfers, peelCount, meta: {},
-    txCount: cs?.tx_count ?? all.length,
-    balance: cs ? `${fmt((cs.funded_txo_sum - cs.spent_txo_sum) / 1e8)} BTC` : null
-  };
+  return { transfers, peelCount };
 }
 
 async function fetchEvm(chain, addr) {
@@ -183,6 +189,15 @@ async function fetchEvm(chain, addr) {
     getData(`${B}/addresses/${addr}/transactions`),
     getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20`)
   ]);
+  const page = parseEvmPage(txs, tts, info);
+  const txCount = Number(counters?.transactions_count || 0) + Number(counters?.token_transfers_count || 0);
+  return {
+    ...page, txCount: txCount || null,
+    balance: info ? `${fmt(Number(info.coin_balance || 0) / 1e18)} ETH` : null
+  };
+}
+
+function parseEvmPage(txs, tts, info) {
   const meta = {};
   const take = o => {
     if (!o?.hash) return null;
@@ -224,15 +239,12 @@ async function fetchEvm(chain, addr) {
       dust: v === 0 || spam || (!rate && /^(USDT|USDC|DAI|WETH|ETH)$/i.test(tt.token?.symbol || ''))
     });
   }
-  const txCount = Number(counters?.transactions_count || 0) + Number(counters?.token_transfers_count || 0);
-  return {
-    transfers, meta, txCount: txCount || null,
-    balance: info ? `${fmt(Number(info.coin_balance || 0) / 1e18)} ETH` : null
-  };
+  const cursor = (txs?.next_page_params || tts?.next_page_params) ? { tx: txs?.next_page_params || null, tt: tts?.next_page_params || null } : null;
+  return { transfers, meta, cursor };
 }
 
-async function fetchTron(addr) {
-  const r = await getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200`);
+async function fetchTron(addr, fp) {
+  const r = await getData(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=200${fp ? '&fingerprint=' + encodeURIComponent(fp) : ''}`);
   const transfers = (r?.data || []).map(d => {
     const dec = Number(d.token_info?.decimals ?? 6);
     const v = Number(d.value) / 10 ** dec;
@@ -245,14 +257,75 @@ async function fetchTron(addr) {
       dust: v === 0 || (!real && /^(USDT|USDC|TUSD)$/i.test(sym))
     };
   });
-  return { transfers, meta: {}, txCount: null, balance: null };
+  return { transfers, meta: {}, txCount: null, balance: null, cursor: r?.meta?.fingerprint ? { fp: r.meta.fingerprint } : null };
 }
+
+const despam = d => { for (const t of d.transfers) if (t.value > 1e12) { t.dust = true; t.usd = null; } return d; };
 
 async function fetchAddr(chain, addr) {
   const d = chain === 'btc' ? await fetchBtc(addr) : isEvm(chain) ? await fetchEvm(chain, addr) : await fetchTron(addr);
   // Absurde bedragen (bv. 2^256-"transfers" van nep-tokens) als spam behandelen.
-  for (const t of d.transfers) if (t.value > 1e12) { t.dust = true; t.usd = null; }
-  return d;
+  return despam(d);
+}
+
+// Volgende pagina transacties van een adres (voor de verkenner).
+async function fetchMore(chain, addr, cursor) {
+  if (!cursor) return null;
+  if (chain === 'btc') {
+    const more = await getData(`${API.btc}/address/${addr}/txs/chain/${cursor.last}`);
+    return despam({ ...parseBtcTxs(addr, more || []), meta: {}, cursor: (more || []).length >= 25 ? { last: more[more.length - 1].txid } : null });
+  }
+  if (isEvm(chain)) {
+    const B = API[chain];
+    const qs = p => Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v ?? '')}`).join('&');
+    const [txs, tts] = await Promise.all([
+      cursor.tx ? getData(`${B}/addresses/${addr}/transactions?${qs(cursor.tx)}`) : null,
+      cursor.tt ? getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20&${qs(cursor.tt)}`) : null
+    ]);
+    return despam(parseEvmPage(txs, tts, null));
+  }
+  const d = await fetchTron(addr, cursor.fp);
+  return despam(d);
+}
+
+// Eén transactie in detail (verkenner).
+const txCache = new Map();
+async function fetchTx(chain, txid) {
+  const ck = chain + ':' + txid;
+  if (txCache.has(ck)) return txCache.get(ck);
+  let r;
+  if (chain === 'btc') {
+    const tx = await getData(`${API.btc}/tx/${txid}`);
+    r = {
+      chain, txid, time: tx.status?.block_time || null, confirmed: !!tx.status?.confirmed, fee: `${fmt(tx.fee / 1e8)} BTC`,
+      inputs: tx.vin.map(v => ({ addr: v.prevout?.scriptpubkey_address || (v.is_coinbase ? 'coinbase (nieuw gemunt)' : '?'), value: (v.prevout?.value || 0) / 1e8, asset: 'BTC', noLink: !v.prevout?.scriptpubkey_address })),
+      outputs: tx.vout.map(o => ({ addr: o.scriptpubkey_address || (o.scriptpubkey_type === 'op_return' ? 'OP_RETURN (data)' : o.scriptpubkey_type), value: o.value / 1e8, asset: 'BTC', noLink: !o.scriptpubkey_address }))
+    };
+  } else if (isEvm(chain)) {
+    const tx = await getData(`${API[chain]}/transactions/${txid}`);
+    const v = Number(tx.value || 0) / 1e18;
+    const transfers = [];
+    if (v > 0) transfers.push({ from: tx.from?.hash?.toLowerCase(), to: tx.to?.hash?.toLowerCase(), value: v, asset: 'ETH' });
+    for (const tt of tx.token_transfers || []) {
+      const dec = Number(tt.total?.decimals ?? tt.token?.decimals ?? 18);
+      transfers.push({ from: tt.from?.hash?.toLowerCase(), to: tt.to?.hash?.toLowerCase(), value: Number(tt.total?.value || 0) / 10 ** dec, asset: tt.token?.symbol || '?' });
+    }
+    r = {
+      chain, txid, time: tx.timestamp ? Date.parse(tx.timestamp) / 1000 : null, confirmed: tx.status === 'ok', failed: tx.status === 'error',
+      fee: tx.fee?.value ? `${fmt(Number(tx.fee.value) / 1e18)} ETH` : null, method: tx.method || null,
+      from: tx.from?.hash?.toLowerCase(), to: tx.to?.hash?.toLowerCase(), transfers
+    };
+  } else {
+    // TronGrid heeft geen keyless tx-detail met tokentransfers: gebruik wat we al van adressen kennen.
+    const transfers = [];
+    for (const n of [...nodes.values(), ...ghosts.values()]) for (const t of n.data?.transfers || []) {
+      if (t.txid === txid && !transfers.some(x => x.from === t.from && x.to === t.to && x.value === t.value)) transfers.push(t);
+    }
+    r = { chain, txid, time: transfers[0]?.time || null, confirmed: true, transfers, partial: true };
+    return r; // niet cachen: kan aanvullen naarmate meer adressen geladen zijn
+  }
+  txCache.set(ck, r);
+  return r;
 }
 
 // ---------- grafiekmodel ----------
@@ -271,10 +344,48 @@ function getNode(chain, addr) {
   const k = keyOf(chain, addr);
   let n = nodes.get(k);
   if (!n) {
-    n = { key: k, chain, addr: norm(chain, addr), role: null, flags: [], data: null, expanded: false, depth: 0, hint: null };
+    n = ghosts.get(k);
+    if (n) { ghosts.delete(k); delete n.ghost; n.depth = n.depth ?? 0; }
+    else n = { key: k, chain, addr: norm(chain, addr), role: null, flags: [], data: null, expanded: false, depth: 0, hint: null };
     nodes.set(k, n);
   }
   return n;
+}
+
+// Adressen die in de verkenner bekeken worden maar (nog) niet in het web staan.
+const ghosts = new Map();
+function peekNode(chain, addr) {
+  const k = keyOf(chain, addr);
+  if (nodes.has(k)) return nodes.get(k);
+  if (!ghosts.has(k)) {
+    const g = { key: k, chain, addr: norm(chain, addr), role: null, flags: [], data: null, expanded: false, depth: null, hint: null, ghost: true };
+    ghosts.set(k, g);
+    lightAnalyze(g);
+  }
+  return ghosts.get(k);
+}
+
+// Voeg een adres toe aan het web en verbind het met adressen die er al staan.
+function addToGraph(n) {
+  const g = getNode(n.chain, n.addr);
+  const linked = [];
+  const scan = (src) => {
+    for (const t of src?.data?.transfers || []) {
+      if (t.dust) continue;
+      const fk = keyOf(g.chain, t.from), tk = keyOf(g.chain, t.to);
+      if ((fk === g.key || tk === g.key) && nodes.has(fk) && nodes.has(tk) && fk !== tk) {
+        addEdge(g.chain, t.from, t.to, t);
+        linked.push(fk === g.key ? tk : fk);
+      }
+    }
+  };
+  scan(g);
+  for (const o of nodes.values()) if (o !== g && o.data) scan(o);
+  const par = linked.map(k => nodes.get(k)).filter(Boolean).sort((a, b) => (a.depth ?? 9) - (b.depth ?? 9))[0];
+  if (par && !g.seed) { g.parent = g.parent || par.key; g.depth = Math.min(g.depth || 99, (par.depth ?? 0) + 1); }
+  lightAnalyze(g);
+  render(false);
+  return g;
 }
 
 function labelOf(n) {
@@ -397,6 +508,15 @@ function addEdge(chain, from, to, t) {
   if (e.txs.length < 50) e.txs.push({ txid: t.txid, value: t.value, asset: t.asset, time: t.time });
 }
 
+function mergeMeta(chain, meta) {
+  for (const [k, m] of Object.entries(meta || {})) {
+    const key = chain + ':' + k;
+    const cur = metaStore[key] || (metaStore[key] = { tags: [] });
+    for (const t of m.tags) if (!cur.tags.includes(t)) cur.tags.push(t);
+    Object.assign(cur, { ...m, tags: cur.tags });
+  }
+}
+
 // Haalt transacties van een adres op (eenmalig), voegt metadata samen en analyseert het adres.
 async function loadData(n) {
   if (n.data) return n.data;
@@ -406,12 +526,7 @@ async function loadData(n) {
     if (err.name !== 'AbortError') addFlag(n, 'error', 'info', 'Ophalen mislukt: ' + err.message);
     return null;
   }
-  for (const [k, m] of Object.entries(n.data.meta)) {
-    const key = n.chain + ':' + k;
-    const cur = metaStore[key] || (metaStore[key] = { tags: [] });
-    for (const t of m.tags) if (!cur.tags.includes(t)) cur.tags.push(t);
-    Object.assign(cur, { ...m, tags: cur.tags });
-  }
+  mergeMeta(n.chain, n.data.meta);
   fullAnalyze(n);
   return n.data;
 }
@@ -624,7 +739,7 @@ function renderOrigins() {
     li.addEventListener('click', ev => {
       if (ev.target.tagName === 'A') return;
       focusNode(li.dataset.k);
-      showNode(nodes.get(li.dataset.k));
+      openNode(nodes.get(li.dataset.k));
     });
   }
 }
@@ -710,9 +825,12 @@ function initCy() {
     minZoom: 0.1, maxZoom: 3,
     style: cyStyle('dark')
   });
-  cy.on('tap', 'node', ev => showNode(nodes.get(ev.target.id())));
-  cy.on('tap', 'edge', ev => showEdge(edges.get(ev.target.id())));
-  cy.on('tap', ev => { if (ev.target === cy) hideDetail(); });
+  cy.on('tap', 'node', ev => {
+    const n = nodes.get(ev.target.id());
+    if (isMobile()) showPeek(n); else openNode(n);
+  });
+  cy.on('tap', 'edge', ev => openEdge(edges.get(ev.target.id())));
+  cy.on('tap', ev => { if (ev.target === cy) { hidePeek(); if (!isMobile()) closeExplorer(); } });
 }
 
 function scheduleRender() {
@@ -759,8 +877,11 @@ function render(final) {
   renderOrigins();
 }
 
+let graphStale = false;
 function runLayout(fit) {
   if (!cy || cy.nodes().length === 0) return;
+  // Web niet zichtbaar (telefoon, andere tab): later schikken als het weer in beeld komt.
+  if (!document.getElementById('cy').offsetWidth) { graphStale = true; return; }
   const opts = layoutName === 'flow'
     ? { name: 'breadthfirst', directed: true, roots: current ? [current.seedKey] : undefined, spacingFactor: 1.2, animate: false }
     : { name: 'cose', animate: false, randomize: !!fit, nodeRepulsion: () => 9000, idealEdgeLength: () => 110, gravity: 0.3, numIter: 600 };
@@ -784,7 +905,7 @@ function renderFindings() {
   $('#findings').querySelectorAll('li').forEach(li => li.addEventListener('click', () => {
     const n = list[+li.dataset.i].n;
     focusNode(n.key);
-    showNode(n);
+    openNode(n);
   }));
 }
 
@@ -799,6 +920,7 @@ function renderPlaybook() {
 }
 
 function focusNode(key) {
+  if (cy && graphStale && $('#cy').offsetWidth) { cy.resize(); graphStale = false; runLayout(true); }
   const el = cy?.getElementById(key);
   if (!el || el.empty()) return;
   cy.$(':selected').unselect();
@@ -829,63 +951,6 @@ function osintLinks(n) {
   ];
 }
 
-function showNode(n) {
-  if (!n) return;
-  const m = metaStore[n.key] || {};
-  const label = labelOf(n);
-  const cls = nodeClass(n);
-  const roleTxt = { victim: 'Slachtoffer', perp: 'Dader', suspect: 'Verdacht', victim2: 'Mogelijk slachtoffer', exchange: 'Exchange / dienst', sanction: 'Sanctie / scamlijst', plain: 'Onbekend' }[cls];
-  const lower = n.addr.toLowerCase();
-  const related = [...edges.values()].filter(e => e.source === n.key || e.target === n.key)
-    .flatMap(e => e.txs.map(t => ({ ...t, dir: e.source === n.key ? 'out' : 'in', cp: nodes.get(e.source === n.key ? e.target : e.source) })))
-    .sort((a, b) => b.time - a.time).slice(0, 30);
-  $('#detailBody').innerHTML = `
-    <h3>${esc(label || short(n.addr))}</h3>
-    <div class="mono">${esc(n.addr)}</div>
-    <div class="tags"><span class="tag">${CHAIN_NAME[n.chain]}</span><span class="tag">${roleTxt}</span>
-      ${n.flags.map(f => `<span class="tag ${f.level}">${esc(f.text)}</span>`).join('')}</div>
-    <h4>OSINT (automatisch)</h4>
-    <dl class="kv">
-      <dt>OFAC-sanctie</dt><dd>${osint.ofac.has(n.addr) || osint.ofac.has(lower) ? '⚠️ JA' : 'nee'}</dd>
-      ${isEvm(n.chain) ? `<dt>ScamSniffer</dt><dd>${osint.scam?.has(lower) ? '⚠️ op blacklist' : osint.scam ? 'niet gevonden' : 'lijst niet geladen'}</dd>` : ''}
-      ${m.tags?.length ? `<dt>Publieke labels</dt><dd>${m.tags.map(esc).join(', ')}</dd>` : ''}
-      ${m.ens ? `<dt>ENS</dt><dd>${esc(m.ens)}</dd>` : ''}
-      ${m.name ? `<dt>Contractnaam</dt><dd>${esc(m.name)}</dd>` : ''}
-      ${window.KNOWN_LABELS[n.addr] ? `<dt>Bekend label</dt><dd>${esc(window.KNOWN_LABELS[n.addr].name)}</dd>` : ''}
-      ${n.data?.txCount ? `<dt>Transacties</dt><dd>${fmt(n.data.txCount)}</dd>` : ''}
-      ${n.data?.balance ? `<dt>Saldo</dt><dd>${esc(n.data.balance)}</dd>` : ''}
-      <dt>Hop</dt><dd>${n.depth ?? 0}${n.expanded ? '' : ' (nog niet opgehaald)'}</dd>
-    </dl>
-    ${dbSection(n)}
-    <h4>OSINT-bronnen</h4>
-    <div class="links">${osintLinks(n).map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`).join('')}</div>
-    <div class="actions">
-      <button class="ghost" data-act="expand">Verder traceren</button>
-      <button class="ghost" data-act="origins">Herkomst zoeken</button>
-      <button class="ghost" data-act="copy">Kopieer adres</button>
-      <button class="ghost" data-act="perp">Markeer dader</button>
-      <button class="ghost" data-act="victim">Markeer slachtoffer</button>
-      <button class="ghost" data-act="label">Label toevoegen</button>
-      <button class="ghost" data-act="remove">Verwijder</button>
-    </div>
-    <h4>Notitie</h4>
-    <textarea id="nodeNote" class="note" rows="3" placeholder="Bijv. bevestigd door slachtoffer, aangifte nr., contact exchange…">${esc(notes.nodes[n.key] || '')}</textarea>
-    <h4>Transacties in het web</h4>
-    <div class="txlist">${related.map(t => `<div><span class="${t.dir}">${t.dir === 'out' ? '→' : '←'} ${esc(t.cp ? (labelOf(t.cp) || short(t.cp.addr)) : '?')}</span><span>${fmt(t.value)} ${esc(t.asset)}</span><span>${fmtTime(t.time)}</span></div>`).join('') || '<em>Nog geen transacties opgehaald.</em>'}</div>`;
-  $('#detailBody').querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => nodeAction(n, b.dataset.act)));
-  let t = null;
-  $('#nodeNote').addEventListener('input', ev => {
-    clearTimeout(t);
-    t = setTimeout(() => {
-      const v = ev.target.value.trim();
-      if (v) notes.nodes[n.key] = v; else delete notes.nodes[n.key];
-      saveNotes();
-      render(false);
-    }, 400);
-  });
-  $('#detail').hidden = false;
-}
-
 function dbSection(n) {
   if (!LOCAL_DB) return '';
   const db = dbLookup(n);
@@ -895,29 +960,374 @@ function dbSection(n) {
     ${obs.length ? `<div class="small" style="margin-top:6px">Eerder gezien in: ${obs.map(o => `${esc(short(o.caseSeed))} (${esc(o.role || o.classification || '?')}, ${new Date(o.seen).toLocaleDateString('nl-NL')})`).join(', ')}</div>` : ''}`;
 }
 
-function showEdge(e) {
-  if (!e) return;
-  const s = nodes.get(e.source), t = nodes.get(e.target);
-  const txUrl = id => ({ btc: `https://mempool.space/tx/${id}`, eth: `https://etherscan.io/tx/${id}`, op: `https://optimistic.etherscan.io/tx/${id}`, tron: `https://tronscan.org/#/transaction/${id}` }[s.chain]);
-  $('#detailBody').innerHTML = `
-    <h3>Geldstroom</h3>
-    <div class="mono">${esc(labelOf(s) || s.addr)}<br>→ ${esc(labelOf(t) || t.addr)}</div>
-    <dl class="kv" style="margin-top:10px">
-      <dt>Totaal</dt><dd>${esc(edgeLabel(e))}</dd>
-      ${e.usd ? `<dt>≈ USD</dt><dd>$${fmt(e.usd)}</dd>` : ''}
-      <dt>Eerste</dt><dd>${fmtTime(e.first)}</dd>
-      <dt>Laatste</dt><dd>${fmtTime(e.last)}</dd>
-    </dl>
-    <h4>Transacties</h4>
-    <div class="txlist">${e.txs.map(x => `<div><a href="${esc(txUrl(x.txid))}" target="_blank" rel="noopener noreferrer" class="mono">${esc(short(x.txid))}</a><span>${fmt(x.value)} ${esc(x.asset)}</span><span>${fmtTime(x.time)}</span></div>`).join('')}</div>`;
+// ---------- verkenner: adressen en transacties doorklikken (zoals Reactor/Chainalysis) ----------
+const nav = { stack: [], i: -1 };
+const isMobile = () => matchMedia('(max-width: 820px)').matches;
+const ROLE_TXT = { victim: 'Slachtoffer', perp: 'Dader', suspect: 'Verdacht', victim2: 'Mogelijk slachtoffer', exchange: 'Exchange / dienst', sanction: 'Sanctie / scamlijst', plain: 'Onbekend' };
+
+function openView(v, { replace = false } = {}) {
+  if (replace && nav.i >= 0) nav.stack[nav.i] = v;
+  else {
+    nav.stack = nav.stack.slice(0, nav.i + 1);
+    nav.stack.push(v);
+    nav.i++;
+    try { history.pushState({ ctv: nav.i }, ''); } catch { /* file:// */ }
+  }
+  hidePeek();
   $('#detail').hidden = false;
+  setTab('detail');
+  $('#detailBody').scrollTop = 0;
+  $('#detail').scrollTop = 0;
+  renderView();
+}
+const openAddr = (chain, addr, tab) => openView({ type: 'addr', chain, addr: norm(chain, addr), tab: tab || 'tx', filter: 'all', limit: 40, cpLimit: 40 });
+const openNode = n => { if (n) openAddr(n.chain, n.addr); };
+const openTx = (chain, txid) => openView({ type: 'tx', chain, txid });
+const openEdge = e => { if (e) openView({ type: 'edge', key: e.key }); };
+const curView = () => nav.stack[nav.i];
+const stillCurrent = v => curView() === v && !$('#detail').hidden;
+function refreshView() { if (nav.i >= 0 && !$('#detail').hidden) renderView(); }
+
+function goBack() {
+  if (nav.i <= 0) { closeExplorer(); return; }
+  if (history.state?.ctv === nav.i) history.back();
+  else { nav.i--; renderView(); }
+}
+function closeExplorer() {
+  const st = history.state?.ctv;
+  if (nav.i >= 0 && st != null && st === nav.i) history.go(-(st + 1));
+  else hideDetail();
+}
+function hideDetail() {
+  $('#detail').hidden = true;
+  nav.stack = []; nav.i = -1;
+  if (document.body.dataset.tab === 'detail') setTab(nodes.size ? 'graph' : 'form');
+}
+window.addEventListener('popstate', ev => {
+  const i = ev.state?.ctv;
+  if (i != null && nav.stack[i]) { nav.i = i; $('#detail').hidden = false; setTab('detail'); renderView(); }
+  else hideDetail();
+});
+
+function viewTitle(v) {
+  if (!v) return '';
+  if (v.type === 'addr') { const n = peekNode(v.chain, v.addr); return labelOf(n) || short(v.addr); }
+  if (v.type === 'tx') return 'Tx ' + short(v.txid);
+  return 'Geldstroom';
+}
+const viewChain = v => v.type === 'edge' ? nodes.get(edges.get(v.key)?.source)?.chain : v.chain;
+
+function navBar() {
+  const prev = nav.stack[nav.i - 1];
+  return `<div class="xnav">
+    ${prev ? `<button type="button" class="xback" data-nav="back">‹ ${esc(viewTitle(prev))}</button>` : `<button type="button" class="xback" data-nav="close">‹ Terug</button>`}
+    <span class="xpos">${nav.i + 1} / ${nav.stack.length}</span>
+    <button type="button" class="xclose" data-nav="close" aria-label="Sluiten">×</button>
+  </div>`;
 }
 
-function hideDetail() { $('#detail').hidden = true; }
+function addrChip(chain, addr, { noLink = false } = {}) {
+  if (noLink || !addr) return `<span class="alink nolink">${esc(addr || '?')}</span>`;
+  const k = keyOf(chain, addr);
+  const n = nodes.get(k) || ghosts.get(k);
+  const cls = n ? nodeClass(n) : 'plain';
+  const lab = n ? labelOf(n) : null;
+  const inWeb = nodes.has(k);
+  return `<button type="button" class="alink" data-addr="${esc(addr)}" title="${esc(addr)}"><i class="dot ${cls}"></i><span class="an">${esc(lab || short(addr))}</span>${lab ? `<small>${esc(short(addr))}</small>` : ''}${inWeb ? '<em class="inweb" title="Staat in het web">◉ web</em>' : ''}</button>`;
+}
+const txChip = txid => `<button type="button" class="txlink" data-tx="${esc(txid)}">${esc(short(txid))}</button>`;
+const sumAssets = list => { const a = {}; for (const t of list) a[t.asset] = (a[t.asset] || 0) + t.value; return a; };
+
+function renderView() {
+  const v = curView();
+  if (!v) return;
+  const body = $('#detailBody');
+  body.dataset.chain = viewChain(v) || '';
+  if (v.type === 'addr') body.innerHTML = addrViewHtml(v);
+  else if (v.type === 'tx') body.innerHTML = txViewHtml(v);
+  else body.innerHTML = edgeViewHtml(v);
+  const note = $('#nodeNote');
+  if (note) {
+    const n = peekNode(v.chain, v.addr);
+    let t = null;
+    note.addEventListener('input', ev => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        const val = ev.target.value.trim();
+        if (val) notes.nodes[n.key] = val; else delete notes.nodes[n.key];
+        saveNotes();
+        if (!n.ghost) render(false);
+      }, 400);
+    });
+  }
+}
+
+// --- adrespagina ---
+function addrViewHtml(v) {
+  const n = peekNode(v.chain, v.addr);
+  if (!n.data && !n.loadTried) {
+    n.loadTried = true;
+    loadData(n).finally(() => { if (stillCurrent(v)) renderView(); if (!n.ghost) render(false); });
+  }
+  const m = metaStore[n.key] || {};
+  const label = labelOf(n);
+  const cls = nodeClass(n);
+  const own = n.addr;
+  const d = n.data;
+  const real = d ? d.transfers.filter(t => !t.dust) : [];
+  const ins = real.filter(t => t.to === own && t.from !== own), outs = real.filter(t => t.from === own && t.to !== own);
+  const times = real.map(t => t.time).filter(Boolean);
+  const loading = !d && !n.flags.some(f => f.code === 'error');
+  const tabs = [['tx', `Transacties${d ? ` <span class="badge">${d.transfers.filter(t => t.from !== t.to).length}${d.cursor ? '+' : ''}</span>` : ''}`], ['cp', 'Tegenpartijen'], ['osint', 'OSINT & notitie']];
+
+  let content = '';
+  if (v.tab === 'osint') content = osintHtml(n, m);
+  else if (loading) content = '<div class="xloading"><span class="spin"></span> Transacties ophalen…</div>';
+  else if (!d) content = `<p class="muted">Ophalen mislukt. ${esc(n.flags.find(f => f.code === 'error')?.text || '')}</p><button type="button" class="ghost wide" data-act="retry">Opnieuw proberen</button>`;
+  else if (v.tab === 'cp') content = cpListHtml(n, v);
+  else content = txListHtml(n, v);
+
+  return `${navBar()}
+    <div class="xhead"><i class="dot big ${cls}"></i><div class="xhead-t"><h3>${esc(label || short(n.addr))}</h3>
+      <div class="mono">${esc(n.addr)} <button type="button" class="mini" data-act="copy">Kopieer</button></div></div></div>
+    <div class="tags"><span class="tag">${CHAIN_NAME[n.chain]}</span><span class="tag">${ROLE_TXT[cls]}</span>${n.ghost ? '<span class="tag">Niet in het web</span>' : ''}
+      ${n.flags.filter(f => f.code !== 'error').map(f => `<span class="tag ${f.level}">${esc(f.text)}</span>`).join('')}</div>
+    <div class="xstats">
+      <div><span>Saldo</span><b>${esc(d?.balance || '—')}</b></div>
+      <div><span>Transacties</span><b>${d?.txCount ? fmt(d.txCount) : d ? fmt(d.transfers.length) + (d.cursor ? '+' : '') : '…'}</b></div>
+      <div><span>Ontvangen*</span><b class="in">${d ? esc(assetText(sumAssets(ins))) : '…'}</b></div>
+      <div><span>Verzonden*</span><b class="out">${d ? esc(assetText(sumAssets(outs))) : '…'}</b></div>
+      <div class="wide"><span>Actief (geladen)</span><b>${times.length ? `${fmtTime(Math.min(...times))} – ${fmtTime(Math.max(...times))}` : '—'}</b></div>
+    </div>
+    <div class="xactions">
+      ${n.ghost ? '<button type="button" class="primary" data-act="add">+ Toevoegen aan web</button>' : '<button type="button" class="primary" data-act="show">Toon in web</button>'}
+      <button type="button" class="ghost" data-act="expand">Volg geld verder</button>
+      <button type="button" class="ghost" data-act="origins">Herkomst zoeken</button>
+      <details class="menu xmore"><summary class="ghost">Meer…</summary><div class="menu-items">
+        <button type="button" data-act="perp">${n.role === 'perp' ? 'Dader-markering weghalen' : 'Markeer als dader'}</button>
+        <button type="button" data-act="victim">${n.role === 'victim' ? 'Slachtoffer-markering weghalen' : 'Markeer als slachtoffer'}</button>
+        <button type="button" data-act="label">Label toevoegen</button>
+        ${!n.ghost && !n.seed ? '<button type="button" data-act="remove">Verwijder uit web</button>' : ''}
+      </div></details>
+    </div>
+    <div class="xtabs">${tabs.map(([k, t]) => `<button type="button" class="${v.tab === k ? 'active' : ''}" data-tab="${k}">${t}</button>`).join('')}</div>
+    <div class="xcontent">${content}</div>`;
+}
+
+function txListHtml(n, v) {
+  const own = n.addr;
+  const d = n.data;
+  let list = d.transfers.filter(t => t.from !== t.to && (t.from === own || t.to === own));
+  const dustCount = list.filter(t => t.dust).length;
+  if (!v.showDust) list = list.filter(t => !t.dust);
+  if (v.filter === 'in') list = list.filter(t => t.to === own);
+  if (v.filter === 'out') list = list.filter(t => t.from === own);
+  list.sort((a, b) => (b.time || 0) - (a.time || 0));
+  const shown = list.slice(0, v.limit);
+  const rows = shown.map(t => {
+    const dir = t.from === own ? 'out' : 'in';
+    const cp = dir === 'out' ? t.to : t.from;
+    return `<div class="xrow ${dir}${t.dust ? ' dust' : ''}">
+      <div class="xrow-top"><span class="dir ${dir}">${dir === 'out' ? '↑ Uit' : '↓ In'}</span>${addrChip(n.chain, cp)}</div>
+      <div class="xrow-sub"><b>${fmt(t.value)} ${esc(t.asset)}</b>${t.usd ? ` <span class="muted">≈ $${fmt(t.usd)}</span>` : ''}${t.dust ? ' <span class="tag med">spam/nul</span>' : ''}
+        <span class="muted">· ${fmtTime(t.time)} ·</span> ${txChip(t.txid)}</div>
+    </div>`;
+  }).join('');
+  const more = list.length > shown.length
+    ? `<button type="button" class="ghost wide" data-more="show">Toon meer (${list.length - shown.length})</button>`
+    : d.cursor ? `<button type="button" class="ghost wide" data-more="fetch" ${n.loadingMore ? 'disabled' : ''}>${n.loadingMore ? 'Laden…' : 'Oudere transacties laden'}</button>` : '';
+  return `<div class="xfilter">
+      ${[['all', 'Alles'], ['in', '↓ In'], ['out', '↑ Uit']].map(([k, t]) => `<button type="button" class="chip ${v.filter === k ? 'active' : ''}" data-filter="${k}">${t}</button>`).join('')}
+      ${dustCount ? `<button type="button" class="chip ${v.showDust ? 'active' : ''}" data-filter="dust">Spam (${dustCount})</button>` : ''}
+    </div>
+    ${rows || '<p class="muted">Geen transacties in deze selectie.</p>'}
+    ${more}
+    <p class="hint">* Op basis van de geladen transacties. Tik op een adres of transactie om erheen te gaan.</p>`;
+}
+
+function cpListHtml(n, v) {
+  const own = n.addr;
+  const agg = new Map();
+  for (const t of n.data.transfers) {
+    if (t.dust || t.from === t.to) continue;
+    const dir = t.from === own ? 'out' : t.to === own ? 'in' : null;
+    if (!dir) continue;
+    const cp = dir === 'out' ? t.to : t.from;
+    const a = agg.get(cp) || { cp, in: [], out: [], usd: 0, last: 0 };
+    a[dir].push(t);
+    a.usd += t.usd || (n.chain === 'btc' ? t.value * 1e4 : 0);
+    a.last = Math.max(a.last, t.time || 0);
+    agg.set(cp, a);
+  }
+  const all = [...agg.values()].sort((x, y) => (y.usd - x.usd) || ((y.in.length + y.out.length) - (x.in.length + x.out.length)));
+  const shown = all.slice(0, v.cpLimit);
+  const rows = shown.map(a => {
+    const inWeb = nodes.has(keyOf(n.chain, a.cp));
+    return `<div class="xrow">
+      <div class="xrow-top">${addrChip(n.chain, a.cp)}${inWeb ? '' : `<button type="button" class="mini add" data-add="${esc(a.cp)}" title="Toevoegen aan web">+ web</button>`}</div>
+      <div class="xrow-sub">${a.in.length ? `<span class="in">↓ ${esc(assetText(sumAssets(a.in)))}</span> ` : ''}${a.out.length ? `<span class="out">↑ ${esc(assetText(sumAssets(a.out)))}</span> ` : ''}
+        <span class="muted">· ${a.in.length + a.out.length} tx · ${fmtTime(a.last)}</span></div>
+    </div>`;
+  }).join('');
+  return `${rows || '<p class="muted">Geen tegenpartijen gevonden.</p>'}
+    ${all.length > shown.length ? `<button type="button" class="ghost wide" data-more="cp">Toon meer (${all.length - shown.length})</button>` : ''}
+    ${n.data.cursor ? `<button type="button" class="ghost wide" data-more="fetch" ${n.loadingMore ? 'disabled' : ''}>${n.loadingMore ? 'Laden…' : 'Oudere transacties laden'}</button>` : ''}`;
+}
+
+function osintHtml(n, m) {
+  const lower = n.addr.toLowerCase();
+  return `<dl class="kv">
+      <dt>OFAC-sanctie</dt><dd>${osint.ofac.has(n.addr) || osint.ofac.has(lower) ? '⚠️ JA' : 'nee'}</dd>
+      ${isEvm(n.chain) ? `<dt>ScamSniffer</dt><dd>${osint.scam?.has(lower) ? '⚠️ op blacklist' : osint.scam ? 'niet gevonden' : 'lijst niet geladen'}</dd>` : ''}
+      ${m.tags?.length ? `<dt>Publieke labels</dt><dd>${m.tags.map(esc).join(', ')}</dd>` : ''}
+      ${m.ens ? `<dt>ENS</dt><dd>${esc(m.ens)}</dd>` : ''}
+      ${m.name ? `<dt>Contractnaam</dt><dd>${esc(m.name)}</dd>` : ''}
+      ${window.KNOWN_LABELS[n.addr] ? `<dt>Bekend label</dt><dd>${esc(window.KNOWN_LABELS[n.addr].name)}</dd>` : ''}
+      <dt>Hop</dt><dd>${n.ghost ? 'niet in het web' : (n.depth ?? 0) + (n.expanded ? '' : ' (nog niet verder gevolgd)')}</dd>
+    </dl>
+    ${dbSection(n)}
+    <h4>OSINT-bronnen</h4>
+    <div class="links">${osintLinks(n).map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`).join('')}</div>
+    <h4>Notitie</h4>
+    <textarea id="nodeNote" class="note" rows="3" placeholder="Bijv. bevestigd door slachtoffer, aangifte nr., contact exchange…">${esc(notes.nodes[n.key] || '')}</textarea>`;
+}
+
+// --- transactiepagina ---
+function txViewHtml(v) {
+  if (!v.data && !v.err && !v.loading) {
+    v.loading = true;
+    fetchTx(v.chain, v.txid).then(r => { v.data = r; }).catch(err => { v.err = err.message; })
+      .finally(() => { v.loading = false; if (stillCurrent(v)) renderView(); });
+  }
+  const r = v.data;
+  const head = `${navBar()}
+    <div class="xhead"><span class="xicon">⇄</span><div class="xhead-t"><h3>Transactie</h3>
+      <div class="mono">${esc(v.txid)} <button type="button" class="mini" data-act="copytx">Kopieer</button></div></div></div>`;
+  if (v.err) return `${head}<p class="muted">Ophalen mislukt: ${esc(v.err)}</p><button type="button" class="ghost wide" data-act="retrytx">Opnieuw proberen</button>`;
+  if (!r) return `${head}<div class="xloading"><span class="spin"></span> Transactie ophalen…</div>`;
+  const status = r.failed ? '<span class="tag high">Mislukt</span>' : r.confirmed ? '<span class="tag info">Bevestigd</span>' : '<span class="tag med">Onbevestigd</span>';
+  const ext = `<div class="links"><a href="${esc(txUrl(r.chain, r.txid))}" target="_blank" rel="noopener noreferrer">Bekijk op ${r.chain === 'btc' ? 'mempool.space' : r.chain === 'tron' ? 'Tronscan' : 'Etherscan'}</a></div>`;
+  let body = '';
+  if (r.chain === 'btc') {
+    const io = (list, title) => `<h4>${title} <span class="badge">${list.length}</span></h4>
+      ${list.map(x => `<div class="xrow"><div class="xrow-top">${addrChip('btc', x.addr, { noLink: x.noLink })}<b class="amt">${fmt(x.value)} BTC</b></div></div>`).join('')}`;
+    body = `<div class="xio"><div>${io(r.inputs, 'Van (inputs)')}</div><div>${io(r.outputs, 'Naar (outputs)')}</div></div>`;
+  } else {
+    body = `${r.from ? `<h4>Afzender → ontvanger</h4><div class="xrow"><div class="xrow-top">${addrChip(r.chain, r.from)}</div><div class="xrow-top">→ ${addrChip(r.chain, r.to)}</div></div>` : ''}
+      <h4>Overboekingen <span class="badge">${r.transfers.length}</span></h4>
+      ${r.transfers.map(t => `<div class="xrow"><div class="xrow-top">${addrChip(r.chain, t.from)}</div><div class="xrow-top">→ ${addrChip(r.chain, t.to)}</div><div class="xrow-sub"><b>${fmt(t.value)} ${esc(t.asset)}</b></div></div>`).join('') || '<p class="muted">Geen waarde-overboekingen.</p>'}
+      ${r.partial ? '<p class="hint">Tron: alleen overboekingen van adressen die de app al geladen heeft. Zie Tronscan voor alles.</p>' : ''}`;
+  }
+  return `${head}
+    <div class="tags"><span class="tag">${CHAIN_NAME[r.chain]}</span>${status}</div>
+    <dl class="kv"><dt>Tijd</dt><dd>${fmtTime(r.time)}</dd>${r.fee ? `<dt>Fee</dt><dd>${esc(r.fee)}</dd>` : ''}${r.method ? `<dt>Methode</dt><dd>${esc(r.method)}</dd>` : ''}</dl>
+    ${body}${ext}`;
+}
+
+// --- geldstroom (lijn in het web) ---
+function edgeViewHtml(v) {
+  const e = edges.get(v.key);
+  if (!e) return `${navBar()}<p class="muted">Deze geldstroom staat niet meer in het web.</p>`;
+  const s = nodes.get(e.source), t = nodes.get(e.target);
+  return `${navBar()}
+    <div class="xhead"><span class="xicon">→</span><div class="xhead-t"><h3>Geldstroom</h3><div class="muted small">${esc(edgeLabel(e))}${e.usd ? ` · ≈ $${fmt(e.usd)}` : ''}</div></div></div>
+    <div class="xrow"><div class="xrow-top"><span class="dir out">Van</span>${addrChip(s.chain, s.addr)}</div><div class="xrow-top"><span class="dir in">Naar</span>${addrChip(t.chain, t.addr)}</div></div>
+    <dl class="kv"><dt>Eerste</dt><dd>${fmtTime(e.first)}</dd><dt>Laatste</dt><dd>${fmtTime(e.last)}</dd><dt>Aantal</dt><dd>${e.count}</dd></dl>
+    <h4>Transacties</h4>
+    ${[...e.txs].sort((a, b) => (b.time || 0) - (a.time || 0)).map(x => `<div class="xrow"><div class="xrow-sub"><b>${fmt(x.value)} ${esc(x.asset)}</b> <span class="muted">· ${fmtTime(x.time)} ·</span> ${txChip(x.txid)}</div></div>`).join('')}`;
+}
+
+async function loadMoreTx(n) {
+  if (!n.data?.cursor || n.loadingMore) return;
+  n.loadingMore = true;
+  refreshView();
+  try {
+    const d = await fetchMore(n.chain, n.addr, n.data.cursor);
+    if (d) {
+      const sig = t => `${t.txid}|${t.from}|${t.to}|${t.asset}|${t.value}`;
+      const seen = new Set(n.data.transfers.map(sig));
+      for (const t of d.transfers) if (!seen.has(sig(t))) { seen.add(sig(t)); n.data.transfers.push(t); }
+      n.data.cursor = d.cursor;
+      n.data.peelCount = (n.data.peelCount || 0) + (d.peelCount || 0);
+      mergeMeta(n.chain, d.meta);
+      fullAnalyze(n);
+      const v = curView();
+      if (v?.type === 'addr') v.limit += 40;
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') setStatus('Meer laden mislukt: ' + err.message, true);
+  }
+  n.loadingMore = false;
+  refreshView();
+}
+
+function ensureCase(n) {
+  if (!current) {
+    current = { chain: n.chain, role: 'victim', pattern: 'generic', opts: readOpts(), seedKey: n.key, started: new Date().toISOString() };
+    loadNotes();
+  }
+}
+
+function onDetailClick(ev) {
+  const b = ev.target.closest('button, [data-addr]');
+  if (!b || !$('#detailBody').contains(b)) return;
+  const v = curView();
+  const chain = $('#detailBody').dataset.chain;
+  if (b.dataset.nav === 'back') return goBack();
+  if (b.dataset.nav === 'close') return closeExplorer();
+  if (b.dataset.addr) return openAddr(chain, b.dataset.addr);
+  if (b.dataset.tx) return openTx(chain, b.dataset.tx);
+  if (!v) return;
+  if (b.dataset.tab) { v.tab = b.dataset.tab; return renderView(); }
+  if (b.dataset.filter) {
+    if (b.dataset.filter === 'dust') v.showDust = !v.showDust; else v.filter = b.dataset.filter;
+    v.limit = 40;
+    return renderView();
+  }
+  if (b.dataset.more === 'show') { v.limit += 60; return renderView(); }
+  if (b.dataset.more === 'cp') { v.cpLimit += 60; return renderView(); }
+  if (b.dataset.more === 'fetch') return loadMoreTx(peekNode(v.chain, v.addr));
+  if (b.dataset.add) {
+    const n = peekNode(v.chain, v.addr);
+    ensureCase(n);
+    if (n.ghost) addToGraph(n);
+    addToGraph(peekNode(v.chain, b.dataset.add));
+    setStatus(`Toegevoegd aan het web: ${short(b.dataset.add)}`);
+    return renderView();
+  }
+  if (b.dataset.act) {
+    b.closest('details')?.removeAttribute('open');
+    if (v.type === 'tx') {
+      if (b.dataset.act === 'copytx') copyText(v.txid);
+      if (b.dataset.act === 'retrytx') { v.err = null; txCache.delete(v.chain + ':' + v.txid); renderView(); }
+      return;
+    }
+    nodeAction(peekNode(v.chain, v.addr), b.dataset.act);
+  }
+}
+
+async function copyText(s) {
+  try { await navigator.clipboard.writeText(s); setStatus('Gekopieerd.'); } catch { prompt('Kopieer:', s); }
+}
+
+// Op de telefoon: eerst een klein kaartje onder in het web, zodat je het web blijft zien.
+function showPeek(n) {
+  if (!n) return;
+  const cls = nodeClass(n);
+  $('#peek').innerHTML = `<div class="peek-t"><i class="dot ${cls}"></i><div><b>${esc(labelOf(n) || short(n.addr))}</b><small>${esc(ROLE_TXT[cls])} · ${esc(short(n.addr))}</small></div></div>
+    <div class="peek-a"><button type="button" class="ghost" data-peek="expand">Volg verder</button><button type="button" class="primary" data-peek="open">Details ›</button></div>`;
+  $('#peek').dataset.key = n.key;
+  $('#peek').hidden = false;
+}
+function hidePeek() { const p = $('#peek'); if (p) p.hidden = true; }
 
 async function nodeAction(n, act) {
-  if (act === 'copy') { try { await navigator.clipboard.writeText(n.addr); setStatus('Adres gekopieerd.'); } catch { prompt('Kopieer:', n.addr); } return; }
-  if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); showNode(n); recordObservations(); return; }
+  if (act === 'copy') return copyText(n.addr);
+  if (act === 'retry') { n.loadTried = false; n.flags = n.flags.filter(f => f.code !== 'error'); return refreshView(); }
+  if (act === 'show') { setTab('graph'); focusNode(n.key); return; }
+  if (act === 'add') { ensureCase(n); addToGraph(n); setStatus('Toegevoegd aan het web.'); return refreshView(); }
+  if (n.ghost && ['perp', 'victim', 'expand', 'origins'].includes(act)) { ensureCase(n); n = addToGraph(n); }
+  if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); refreshView(); recordObservations(); return; }
   if (act === 'label') {
     const v = prompt('Label voor dit adres (leeg = verwijderen):', customLabels[n.key] || '');
     if (v === null) return;
@@ -926,17 +1336,17 @@ async function nodeAction(n, act) {
     if (LOCAL_DB) { try { window.AndroidBridge.saveUserLabel(n.chain, n.addr, v.trim()); } catch { /* niet fataal */ } dbCache.delete(n.key); }
     n.flags = n.flags.filter(f => f.code !== 'exchange');
     lightAnalyze(n);
-    render(false); showNode(n); return;
+    if (!n.ghost) render(false);
+    refreshView(); return;
   }
   if (act === 'remove') {
     if (n.seed) return;
     nodes.delete(n.key);
     for (const [k, e] of edges) if (e.source === n.key || e.target === n.key) edges.delete(k);
     cy.getElementById(n.key).remove();
-    hideDetail(); render(false); return;
+    closeExplorer(); render(false); return;
   }
   if (act === 'origins') {
-    if (!current) return;
     stopped = false;
     setBusy(true);
     await traceOrigins(n, { depth: 3, fanIn: Math.max(4, current.opts.fanout) });
@@ -944,22 +1354,42 @@ async function nodeAction(n, act) {
     render(true);
     renderSummary();
     setStatus(`Herkomst: ${origins.starts.size} startwallets, ${origins.cashIn.length} instroom-transacties.`);
-    showNode(n);
+    refreshView();
     return;
   }
   if (act === 'expand') {
-    if (!current) return;
     stopped = false;
     setBusy(true);
     n.expanded = false;
-    const before = current.opts.maxNodes;
-    current.opts.maxNodes = Math.max(before, nodes.size + current.opts.fanout * 2);
+    current.opts.maxNodes = Math.max(current.opts.maxNodes, nodes.size + current.opts.fanout * 2);
     await expand(n, n.depth || 0, 'both');
     setBusy(false);
     render(false);
     setStatus(`${nodes.size} adressen, ${edges.size} geldstromen.`);
-    showNode(n);
+    refreshView();
   }
+}
+
+// ---------- tabbladen (telefoon) en zoeken ----------
+function setTab(tab) {
+  document.body.dataset.tab = tab;
+  document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.go === tab));
+  $('#tabDetail').disabled = nav.i < 0;
+  if (tab === 'graph' && cy) requestAnimationFrame(() => { cy.resize(); if (graphStale) { graphStale = false; runLayout(true); } });
+}
+
+function exploreQuery(q) {
+  q = q.trim();
+  if (!q) return;
+  const ch = detectChain(q);
+  if (ch) {
+    const chain = isEvm(ch) && current && isEvm(current.chain) ? current.chain : ch;
+    return openAddr(chain, q);
+  }
+  if (/^0x[0-9a-fA-F]{64}$/.test(q)) return openTx(current && isEvm(current.chain) ? current.chain : 'eth', q.toLowerCase());
+  if (/^[0-9a-fA-F]{64}$/.test(q)) return openTx(current?.chain === 'tron' ? 'tron' : 'btc', q.toLowerCase());
+  setStatus('Niet herkend als adres of transactie-hash.', true);
+  setTab('form');
 }
 
 // ---------- export / import ----------
@@ -1403,7 +1833,8 @@ function importJson(text) {
 
 // ---------- UI ----------
 function resetGraph() {
-  nodes.clear(); edges.clear();
+  nodes.clear(); edges.clear(); ghosts.clear();
+  hidePeek();
   origins.rootKey = null; origins.starts = new Map(); origins.cashIn = [];
   if (cy) cy.elements().remove();
   hideDetail();
@@ -1484,13 +1915,14 @@ function setup() {
     const role = document.querySelector('input[name=role]:checked').value;
     const pattern = $('#pattern').value;
     try { history.replaceState(null, '', `?addr=${encodeURIComponent(addr)}&chain=${chain}&role=${role}&pattern=${pattern}`); } catch { /* file:// */ }
+    if (isMobile()) setTab('graph');
     runTrace(addr, chain, role, pattern, readOpts()).catch(err => {
       setBusy(false);
       if (err.name !== 'AbortError') setStatus('Fout: ' + err.message, true);
     });
   });
   $('#btnStop').addEventListener('click', () => { stopped = true; abortCtl.abort(); setBusy(false); setStatus('Gestopt.'); render(true); });
-  $('#detailClose').addEventListener('click', hideDetail);
+  $('#detailBody').addEventListener('click', onDetailClick);
   $('#btnExportJson').addEventListener('click', exportJson);
   $('#btnExportPng').addEventListener('click', () => $('#exportDialog').showModal());
   $('#btnExpReport').addEventListener('click', () => exportReport('report'));
@@ -1501,7 +1933,7 @@ function setup() {
   $('#fileImport').addEventListener('change', async ev => {
     const f = ev.target.files[0];
     if (!f) return;
-    try { importJson(await f.text()); } catch (err) { setStatus('Import mislukt: ' + err.message, true); }
+    try { importJson(await f.text()); if (isMobile()) setTab('graph'); } catch (err) { setStatus('Import mislukt: ' + err.message, true); }
     ev.target.value = '';
   });
   const setLayout = name => {
@@ -1515,6 +1947,28 @@ function setup() {
   $('#btnFit').addEventListener('click', () => cy?.fit(undefined, 40));
 
   setupDbDialog();
+
+  // Tabbalk (telefoon), zoeken in de verkenner en het kaartje onder in het web.
+  document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
+    if (b.dataset.go === 'detail' && nav.i < 0) return;
+    if (b.dataset.go === 'detail') $('#detail').hidden = false;
+    setTab(b.dataset.go);
+  }));
+  $('#exploreForm').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const q = $('#exploreQ').value;
+    $('#exploreQ').blur();
+    exploreQuery(q);
+  });
+  $('#peek').addEventListener('click', ev => {
+    const b = ev.target.closest('[data-peek]');
+    const n = nodes.get($('#peek').dataset.key);
+    if (!b || !n) return;
+    if (b.dataset.peek === 'open') openNode(n);
+    else { hidePeek(); nodeAction(n, 'expand'); }
+  });
+  if (!isMobile()) document.querySelector('.legend-wrap').open = true;
+  setTab('form');
 
   const q = new URLSearchParams(location.search);
   if (q.get('addr')) {
@@ -1573,5 +2027,5 @@ function setupDbDialog() {
 
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

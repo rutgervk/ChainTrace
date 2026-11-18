@@ -2,7 +2,8 @@
 <html lang="nl">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#171e26">
 <title>ChainTrace</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -15,6 +16,9 @@
       <p class="sub">Open-source blockchain-onderzoek · geen login · OSINT</p>
     </div>
   </div>
+  <form id="exploreForm" class="explore" role="search" autocomplete="off">
+    <input id="exploreQ" type="search" spellcheck="false" enterkeyhint="search" placeholder="Zoek adres of transactie-hash…" aria-label="Zoek adres of transactie">
+  </form>
   <div class="top-actions">
     <button id="btnPdf" class="ghost accent" disabled>PDF-rapport</button>
     <details class="menu" id="moreMenu">
@@ -119,6 +123,9 @@
       <button id="btnLayoutFlow" class="chip" type="button">Stroom</button>
       <button id="btnFit" class="chip" type="button">Passend</button>
     </div>
+    <div id="peek" class="peek" hidden></div>
+    <details class="legend-wrap">
+    <summary class="chip">Legenda</summary>
     <div class="legend">
       <span><i class="dot victim"></i>Slachtoffer</span>
       <span><i class="dot victim2"></i>Mogelijk slachtoffer</span>
@@ -128,12 +135,14 @@
       <span><i class="dot sanction"></i>Sanctie/scam-lijst</span>
       <span><i class="dot plain"></i>Onbekend</span>
     </div>
+    </details>
     <div id="empty" class="empty">
       <div class="steps">
-        <h2>Volg het geld in drie stappen</h2>
+        <h2>Volg het geld</h2>
         <ol>
           <li><b>Plak een walletadres</b> — van het slachtoffer of van de dader.</li>
           <li><b>Start het onderzoek</b> — de app tekent waar het geld heen ging en waar het vandaan kwam.</li>
+          <li><b>Klik door</b> — tik op een adres of transactie en blijf doorklikken, net als in een blockchain-explorer.</li>
           <li><b>Maak een PDF-rapport</b> — met alle adressen en transacties, voor je aangifte.</li>
         </ol>
         <p>Geen account nodig. Je gegevens blijven op dit apparaat.</p>
@@ -142,10 +151,15 @@
   </section>
 
   <aside class="panel detail-panel" id="detail" hidden>
-    <button class="close" id="detailClose" type="button" aria-label="Sluiten">×</button>
     <div id="detailBody"></div>
   </aside>
 </main>
+
+<nav class="tabbar" aria-label="Schermen">
+  <button type="button" data-go="form" class="active"><span>🔎</span>Onderzoek</button>
+  <button type="button" data-go="graph"><span>🕸</span>Web</button>
+  <button type="button" data-go="detail" id="tabDetail" disabled><span>📄</span>Verkenner</button>
+</nav>
 
 <dialog id="dbDialog" class="dlg">
   <div class="dlg-head">
