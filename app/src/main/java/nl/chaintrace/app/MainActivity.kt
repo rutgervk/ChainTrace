@@ -70,7 +70,7 @@ class MainActivity : ComponentActivity() {
                 ): Boolean {
                     fileCallback?.onReceiveValue(null)
                     fileCallback = callback
-                    pickFile.launch("*/*")
+                    pickFile.launch(if (params.acceptTypes.any { it.startsWith("image/") }) "image/*" else "*/*")
                     return true
                 }
 
@@ -108,6 +108,27 @@ class MainActivity : ComponentActivity() {
             val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
             cm.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString() ?: ""
         }.getOrDefault("")
+
+        @JavascriptInterface
+        fun writeClipboard(text: String) {
+            runOnUiThread {
+                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("ChainTrace", text))
+            }
+        }
+
+        /** Tekst delen via e-mail, WhatsApp e.d. (bv. de brief aan een exchange). */
+        @JavascriptInterface
+        fun shareText(subject: String, text: String) {
+            runOnUiThread {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, subject)
+                    putExtra(Intent.EXTRA_TEXT, text)
+                }
+                runCatching { startActivity(Intent.createChooser(send, "Delen via")) }
+            }
+        }
 
         private val db get() = OsintDb.get(this@MainActivity)
 

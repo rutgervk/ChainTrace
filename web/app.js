@@ -93,15 +93,24 @@ async function throttle(host) {
   if (at > now) await sleep(at - now);
 }
 
-function getData(url, asText = false) {
+function getData(url, asText = false, tries = 6) {
   if (cache.has(url)) return cache.get(url);
   const host = new URL(url).host;
   const p = (async () => {
     await acquire();
     try {
-      for (let attempt = 0; attempt < 6; attempt++) {
+      for (let attempt = 0; attempt < tries; attempt++) {
         await throttle(host);
-        const r = await fetch(url, { signal: abortCtl.signal });
+        // Eigen time-out: sommige API's laten een verzoek eindeloos hangen.
+        const ctl = new AbortController(), outer = abortCtl.signal;
+        const onAbort = () => ctl.abort();
+        outer.addEventListener('abort', onAbort, { once: true });
+        let timedOut = false;
+        const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, tries <= 2 ? 15000 : 30000);
+        let r;
+        try { r = await fetch(url, { signal: ctl.signal }); }
+        catch (err) { if (timedOut) throw new Error('Geen antwoord van ' + host); throw err; }
+        finally { clearTimeout(timer); outer.removeEventListener('abort', onAbort); }
         if (r.status === 429 || r.status >= 500) {
           const ra = Number(r.headers.get('retry-after'));
           await sleep(ra > 0 ? Math.min(ra * 1000, 20000) : Math.min(1000 * 2 ** attempt, 15000));
@@ -184,8 +193,8 @@ function parseBtcTxs(addr, all) {
 async function fetchEvm(chain, addr) {
   const B = API[chain];
   const [info, counters, txs, tts] = await Promise.all([
-    getData(`${B}/addresses/${addr}`).catch(() => null),
-    getData(`${B}/addresses/${addr}/counters`).catch(() => null),
+    getData(`${B}/addresses/${addr}`, false, 2).catch(() => null),
+    getData(`${B}/addresses/${addr}/counters`, false, 2).catch(() => null),
     getData(`${B}/addresses/${addr}/transactions`),
     getData(`${B}/addresses/${addr}/token-transfers?type=ERC-20`)
   ]);
@@ -418,7 +427,9 @@ function lightAnalyze(n) {
   if (m?.reputation) addFlag(n, 'reputation', 'med', `Reputatie: ${m.reputation}`);
   if (MIXER_RE.test(text)) addFlag(n, 'mixer', 'high', 'Mixer / privacy-dienst');
   else if (BAD_RE.test(text)) addFlag(n, 'badtag', 'high', 'Publiek label wijst op fraude/hack');
-  if (known?.type === 'exchange' || EXCHANGE_RE.test(text)) addFlag(n, 'exchange', 'info', 'Exchange — cash-out-punt, bevriezing/informatieverzoek mogelijk');
+  // Bridges en decentrale exchanges (DEX) hebben geen klantgegevens: niet als exchange tellen.
+  const notCex = BRIDGE_RE.test(text) || /decentrali[sz]ed|\bdex\b|swap|router|aggregator|settler/i.test(text);
+  if (known?.type === 'exchange' || (EXCHANGE_RE.test(text) && !notCex)) addFlag(n, 'exchange', 'info', 'Exchange — cash-out-punt, bevriezing/informatieverzoek mogelijk');
   if (BRIDGE_RE.test(text)) addFlag(n, 'bridge', 'med', 'Bridge — geld gaat naar een andere keten');
   if (m?.contract || known?.type === 'contract') addFlag(n, 'contract', 'info', 'Smart contract');
   const db = dbLookup(n);
@@ -875,6 +886,7 @@ function render(final) {
   $('#btnExportPng').disabled = $('#btnExportJson').disabled = $('#btnPdf').disabled = nodes.size === 0;
   $('#findingsBox').hidden = nodes.size === 0;
   renderOrigins();
+  if (current) renderRoutes();
 }
 
 let graphStale = false;
@@ -887,6 +899,8 @@ function runLayout(fit) {
     : { name: 'cose', animate: false, randomize: !!fit, nodeRepulsion: () => 9000, idealEdgeLength: () => 110, gravity: 0.3, numIter: 600 };
   cy.layout({ ...opts, fit: true, padding: 40 }).run();
   if (fit) cy.fit(undefined, 40);
+  // Bij heel weinig adressen niet extreem inzoomen.
+  if (cy.zoom() > 1.4) { cy.zoom(1.4); cy.center(); }
 }
 
 function renderFindings() {
@@ -912,7 +926,7 @@ function renderFindings() {
 function renderPlaybook() {
   if (!current) return;
   const pat = window.PATTERNS[current.pattern];
-  const exch = [...nodes.values()].filter(n => n.flags.some(f => f.code === 'exchange' || f.code === 'service'));
+  const exch = [...nodes.values()].filter(n => endKind(n) === 'exchange');
   const steps = [...pat.steps];
   if (exch.length) steps.splice(1, 0, `Gevonden cash-out-punten: ${exch.slice(0, 5).map(n => esc(labelOf(n) || short(n.addr))).join(', ')}.`);
   $('#playbookList').innerHTML = steps.map(s => `<li>${s}</li>`).join('');
@@ -1090,8 +1104,9 @@ function addrViewHtml(v) {
   return `${navBar()}
     <div class="xhead"><i class="dot big ${cls}"></i><div class="xhead-t"><h3>${esc(label || short(n.addr))}</h3>
       <div class="mono">${esc(n.addr)} <button type="button" class="mini" data-act="copy">Kopieer</button></div></div></div>
-    <div class="tags"><span class="tag">${CHAIN_NAME[n.chain]}</span><span class="tag">${ROLE_TXT[cls]}</span>${n.ghost ? '<span class="tag">Niet in het web</span>' : ''}
-      ${n.flags.filter(f => f.code !== 'error').map(f => `<span class="tag ${f.level}">${esc(f.text)}</span>`).join('')}</div>
+    <div class="tags"><span class="tag">${CHAIN_NAME[n.chain]}</span><button type="button" class="tag help" data-help="${cls}">${ROLE_TXT[cls]} <i>?</i></button>${n.ghost ? '<span class="tag">Niet in het web</span>' : ''}
+      ${n.flags.filter(f => f.code !== 'error').map(f => HELP[f.code] ? `<button type="button" class="tag help ${f.level}" data-help="${f.code}">${esc(f.text)} <i>?</i></button>` : `<span class="tag ${f.level}">${esc(f.text)}</span>`).join('')}</div>
+    ${(() => { const st = plainStory(n); return st.length ? `<div class="story"><b>In gewone taal</b>${st.map(x => `<p>${esc(x)}</p>`).join('')}</div>` : ''; })()}
     <div class="xstats">
       <div><span>Saldo</span><b>${esc(d?.balance || '—')}</b></div>
       <div><span>Transacties</span><b>${d?.txCount ? fmt(d.txCount) : d ? fmt(d.transfers.length) + (d.cursor ? '+' : '') : '…'}</b></div>
@@ -1101,8 +1116,9 @@ function addrViewHtml(v) {
     </div>
     <div class="xactions">
       ${n.ghost ? '<button type="button" class="primary" data-act="add">+ Toevoegen aan web</button>' : '<button type="button" class="primary" data-act="show">Toon in web</button>'}
-      <button type="button" class="ghost" data-act="expand">Volg geld verder</button>
-      <button type="button" class="ghost" data-act="origins">Herkomst zoeken</button>
+      ${endKind(n) === 'exchange' && !n.ghost ? `<button type="button" class="primary letter" data-letter="${esc(n.key)}">✉ Brief aan ${esc(exName(labelOf(n)) || 'deze exchange')}</button>` : ''}
+      <button type="button" class="ghost" data-act="expand">Waar ging het geld heen?</button>
+      <button type="button" class="ghost" data-act="origins">Waar kwam het vandaan?</button>
       <details class="menu xmore"><summary class="ghost">Meer…</summary><div class="menu-items">
         <button type="button" data-act="perp">${n.role === 'perp' ? 'Dader-markering weghalen' : 'Markeer als dader'}</button>
         <button type="button" data-act="victim">${n.role === 'victim' ? 'Slachtoffer-markering weghalen' : 'Markeer als slachtoffer'}</button>
@@ -1315,7 +1331,7 @@ function showPeek(n) {
   if (!n) return;
   const cls = nodeClass(n);
   $('#peek').innerHTML = `<div class="peek-t"><i class="dot ${cls}"></i><div><b>${esc(labelOf(n) || short(n.addr))}</b><small>${esc(ROLE_TXT[cls])} · ${esc(short(n.addr))}</small></div></div>
-    <div class="peek-a"><button type="button" class="ghost" data-peek="expand">Volg verder</button><button type="button" class="primary" data-peek="open">Details ›</button></div>`;
+    <div class="peek-a"><button type="button" class="ghost" data-peek="expand">Volg het geld</button><button type="button" class="primary" data-peek="open">Details ›</button></div>`;
   $('#peek').dataset.key = n.key;
   $('#peek').hidden = false;
 }
@@ -1366,6 +1382,7 @@ async function nodeAction(n, act) {
     setBusy(false);
     render(false);
     setStatus(`${nodes.size} adressen, ${edges.size} geldstromen.`);
+    renderSummary();
     refreshView();
   }
 }
@@ -1620,11 +1637,11 @@ function summaryLines() {
   const out = [];
   const down = all.filter(n => !n.upstream && !n.seed);
   out.push({ text: `Vanaf het adres van ${current.role === 'perp' ? 'de dader' : 'het slachtoffer'} is het geld gevolgd langs ${down.length} adressen.` });
-  const exch = down.filter(n => n.flags.some(f => f.code === 'exchange' || f.code === 'service'));
+  const exch = down.filter(n => endKind(n) === 'exchange');
   if (exch.length) {
     out.push({ cls: 'good', text: `Het geld komt uit bij ${exch.length} exchange(s) of dienst(en): ${nameList(exch.map(n => labelOf(n) || 'onbekende dienst ' + short(n.addr)))}. Daar kan de politie opvragen wie de rekeninghouder is en om bevriezing vragen.` });
   } else {
-    out.push({ text: 'Er is nog geen exchange gevonden waar het geld uitkomt. Tik op een oranje adres en kies "Verder traceren" om dieper te zoeken.' });
+    out.push({ text: 'Er is nog geen exchange gevonden waar het geld uitkomt. Tik op een oranje adres en kies "Waar ging het geld heen?" om dieper te zoeken.' });
   }
   const bad = all.filter(n => n.flags.some(f => BAD_CODES.includes(f.code)));
   if (bad.length) out.push({ cls: 'warn', text: `${bad.length} adres(sen) staan op een waarschuwingslijst (sanctie, scam, ransomware, mixer of door Tether bevroren).` });
@@ -1708,6 +1725,21 @@ async function exportPdf() {
     heading('Samenvatting');
     for (const l of summaryLines()) para('-  ' + l.text);
     y += 3;
+
+    const mr = moneyRoutes(6);
+    if (mr.routes.length) {
+      heading(mr.reached ? 'Het geld stap voor stap' : 'Het geld stap voor stap (nog niet bij een exchange)');
+      mr.routes.forEach((r, i) => {
+        const kind = endKind(r.end);
+        para(`Route ${i + 1}: eindigt bij ${labelOf(r.end) || (kind ? END_NL[kind] : r.end.addr)}`, 10, 20);
+        r.steps.forEach((e, j) => {
+          const st = stepText(e);
+          para(`${j + 1}. ${st.when}: ${st.text}`, 9, 45, 4);
+          para(`van ${nodes.get(e.source).addr}  naar ${nodes.get(e.target).addr}`, 7, 120, 8);
+        });
+        y += 2;
+      });
+    }
 
     // grafiek (als JPEG om het bestand klein te houden)
     const img = await loadImage(graphImage('light', 2600));
@@ -1886,8 +1918,7 @@ function setup() {
     try { txt = window.AndroidBridge?.readClipboard ? window.AndroidBridge.readClipboard() : await navigator.clipboard.readText(); } catch { /* geen toegang */ }
     txt = (txt || '').trim();
     if (!txt) { setStatus('Plakken lukt hier niet automatisch. Houd het veld ingedrukt en kies Plakken.', true); return; }
-    $('#addr').value = txt;
-    updateChainHint();
+    if (!smartFill(txt, 'paste')) { $('#addr').value = txt; updateChainHint(); }
     setStatus('');
   });
   $('#btnPdf').addEventListener('click', () => exportPdf().catch(() => {}));
@@ -1904,7 +1935,12 @@ function setup() {
     const det = detectChain(addr);
     let chain = $('#chain').value;
     if (chain === 'auto') chain = det;
-    if (!chain) { setStatus('Dit adres wordt niet herkend. Controleer of je het hele adres hebt geplakt.', true); return; }
+    if (!chain) {
+      const x = extractFromText(addr);
+      if (x?.kind === 'tx') { openTx(x.chain || (current?.chain === 'tron' ? 'tron' : 'btc'), x.value); setStatus('Dit is een transactie: tik in de verkenner op het adres dat je wilt onderzoeken.'); return; }
+      if (x?.kind === 'addr') { smartFill(addr, 'paste'); setStatus('Adres uit de tekst gehaald. Tik nog een keer op Start.'); return; }
+      setStatus('Dit adres wordt niet herkend. Controleer of je het hele adres hebt geplakt.', true); return;
+    }
     const ri = recent.indexOf(addr);
     if (ri >= 0) recent.splice(ri, 1);
     recent.unshift(addr);
@@ -1947,6 +1983,7 @@ function setup() {
   $('#btnFit').addEventListener('click', () => cy?.fit(undefined, 40));
 
   setupDbDialog();
+  setupSimple();
 
   // Tabbalk (telefoon), zoeken in de verkenner en het kaartje onder in het web.
   document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
@@ -2025,7 +2062,339 @@ function setupDbDialog() {
   });
 }
 
+// ---------- eenvoud: uitleg, geldroute, brief aan exchange, slim invoeren ----------
+const HELP = {
+  address: ['Walletadres', 'Een soort rekeningnummer voor crypto. Iedereen kan zonder naam zoveel adressen aanmaken als hij wil. Pas bij een exchange is te achterhalen van wie een adres is.'],
+  tx: ['Transactie (tx-hash)', 'Elke overboeking heeft een unieke code: de transactie-hash. Daarmee kan iedereen, ook de politie of een exchange, precies die overboeking terugvinden. Zet hem altijd in je aangifte.'],
+  hop: ['Stap (hop)', 'Elke keer dat geld naar een volgend adres gaat, is één stap. Hoe meer stappen, hoe minder zeker het is dat het nog hetzelfde geld is.'],
+  victim: ['Slachtoffer', 'Het adres waar het geld van het slachtoffer vandaan kwam (of dat je zelf als slachtoffer hebt gemarkeerd).'],
+  victim2: ['Mogelijk slachtoffer', 'Iemand die geld naar de dader stuurde. Dat kan een ander slachtoffer zijn. Het is een aanwijzing, geen zekerheid.'],
+  perp: ['Dader', 'Een adres dat je als dader hebt gemarkeerd, of dat sterk lijkt op een valstrik-adres.'],
+  suspect: ['Verdacht', 'Dit adres ontving geld van het slachtoffer, of gedraagt zich verdacht (geld snel doorsturen, van veel mensen ontvangen). Het is een aanwijzing, geen bewijs.'],
+  plain: ['Onbekend', 'Over dit adres is (nog) niets bijzonders bekend.'],
+  exchange: ['Exchange', 'Een bedrijf waar mensen crypto kopen en verkopen, zoals Binance, Coinbase of Bitvavo. Klanten moeten zich daar met een ID registreren. Daarom kan de politie bij een exchange opvragen van wie een account is, en vragen het geld te bevriezen. Dit is meestal het belangrijkste spoor.'],
+  service: ['Zeer druk adres', 'Dit adres doet zoveel transacties dat het vrijwel zeker van een bedrijf is (vaak een exchange of betaaldienst), niet van één persoon.'],
+  sanction: ['Waarschuwingslijst', 'Dit adres staat op een lijst met verboden of bekende criminele partijen, zoals de sanctielijst van de Amerikaanse overheid (OFAC) of een scamlijst.'],
+  scamlist: ['Scamlijst', 'Dit adres is eerder door anderen gemeld als oplichting, phishing of hack.'],
+  badtag: ['Fraude-label', 'Een openbare blockchain-verkenner heeft dit adres een label gegeven dat op fraude of een hack wijst.'],
+  ransomware: ['Ransomware', 'Dit adres is gebruikt om losgeld te ontvangen voor gegijzelde computers.'],
+  frozen: ['Bevroren door Tether', 'Tether (het bedrijf achter USDT) heeft dit adres geblokkeerd. Het geld kan daar niet meer weg. Tether werkt samen met politie.'],
+  darknet: ['Darknet', 'Dit adres hoort bij een verborgen marktplaats op internet waar illegale spullen worden verkocht.'],
+  mixer: ['Mixer', 'Een dienst die geld van veel mensen door elkaar husselt, zodat je niet meer ziet waar het vandaan komt. Na een mixer is het spoor meestal niet verder te volgen.'],
+  bridge: ['Bridge', 'Een dienst die geld overzet naar een andere blockchain (bijvoorbeeld van Ethereum naar Tron). Het spoor gaat dan verder op die andere blockchain.'],
+  contract: ['Smart contract', 'Een programma op de blockchain, geen persoon. Bijvoorbeeld een online wisselkantoor (DEX) of een munt. Geld dat erin gaat, komt er vaak elders weer uit.'],
+  startwallet: ['Startwallet', 'Het verste adres waar het geld naar terug te volgen was. Als de dader geld kreeg van zo\'n adres, kan dat een ander slachtoffer zijn.'],
+  passthrough: ['Doorsluisadres', 'Geld komt binnen en gaat binnen een uur weer weg. Oplichters doen dat om het spoor moeilijker te volgen te maken.'],
+  fanin: ['Verzameladres', 'Dit adres ontvangt geld van veel verschillende mensen. Bij oplichting kan dat betekenen dat er meer slachtoffers zijn.'],
+  fanout: ['Verspreidadres', 'Dit adres stuurt geld naar veel verschillende adressen. Zo wordt het geld opgeknipt om het spoor te verbergen.'],
+  peel: ['Peel chain', 'Steeds een klein deel afsplitsen en de rest doorsturen naar een nieuw adres. Een bekende witwastruc bij Bitcoin.'],
+  lookalike: ['Lijkt-op-adres (address poisoning)', 'Oplichters maken een adres dat aan het begin en eind hetzelfde is als een adres dat je vaker gebruikt. Wie dan een adres uit de geschiedenis kopieert, stuurt het geld per ongeluk naar de oplichter. Vergelijk daarom altijd het hele adres.'],
+  dust: ['Spam / nul-transacties', 'Overboekingen van 0 of met nepmunten. Vaak bedoeld om een lijkt-op-adres in de geschiedenis van het slachtoffer te zetten.'],
+  seenbefore: ['Eerder gezien', 'Dit adres kwam al voor in een ander onderzoek op dit apparaat.'],
+  reputation: ['Reputatie', 'De blockchain-verkenner waarschuwt dat dit adres of deze munt niet te vertrouwen is.']
+};
+const HELP_ORDER = ['address', 'tx', 'hop', 'exchange', 'mixer', 'bridge', 'contract', 'sanction', 'frozen', 'startwallet', 'suspect', 'victim2', 'passthrough', 'fanin', 'fanout', 'peel', 'lookalike', 'dust', 'service'];
+
+function showHelp(key) {
+  const h = HELP[key];
+  if (!h) return;
+  $('#helpBody').innerHTML = `<h2>${esc(h[0])}</h2><p>${esc(h[1])}</p>`;
+  $('#helpDlg').showModal();
+}
+function showGlossary() {
+  $('#helpBody').innerHTML = `<h2>Woordenlijst</h2>${HELP_ORDER.map(k => `<h3>${esc(HELP[k][0])}</h3><p>${esc(HELP[k][1])}</p>`).join('')}`;
+  $('#helpDlg').showModal();
+}
+
+// --- uitleg van één adres in gewone taal ---
+const bal0 = b => !b || /^0([.,]0+)? /.test(b);
+function plainStory(n) {
+  const out = [];
+  const has = c => n.flags.some(f => f.code === c);
+  const lab = labelOf(n);
+  if (n.role === 'victim') out.push('Dit is het adres van het slachtoffer.');
+  if (n.role === 'perp') out.push('Dit adres is gemarkeerd als dader.');
+  if (has('exchange')) out.push(`Dit adres hoort bij ${lab || 'een exchange'}. Hier kan de politie opvragen van wie het account is, en vragen het geld te bevriezen. Maak hiervoor de brief aan de exchange.`);
+  else if (has('service')) out.push('Dit adres is zó actief dat het vrijwel zeker van een bedrijf is (exchange of betaaldienst). Ook hier kan de politie gegevens opvragen.');
+  else if (has('mixer')) out.push('Dit is een mixer: hier wordt geld onherkenbaar gemaakt. Verder volgen lukt meestal niet.');
+  else if (has('bridge')) out.push('Via dit adres is geld naar een andere blockchain gegaan. Het spoor gaat daar verder.');
+  else if (has('contract')) out.push('Dit is een programma (smart contract), geen persoon.');
+  const bad = n.flags.filter(f => BAD_CODES.includes(f.code));
+  if (bad.length) out.push(`Let op: dit adres staat op een waarschuwingslijst (${bad.map(f => HELP[f.code]?.[0] || f.code).join(', ')}).`);
+  if (n.flags.some(f => f.code === 'lookalike' && f.level === 'high')) out.push('Dit adres lijkt sterk op een ander adres: waarschijnlijk een valstrik (address poisoning).');
+  const d = n.data;
+  if (d) {
+    const real = d.transfers.filter(t => !t.dust && t.from !== t.to);
+    const ins = real.filter(t => t.to === n.addr), outs = real.filter(t => t.from === n.addr);
+    const s = new Set(ins.map(t => t.from)).size, r = new Set(outs.map(t => t.to)).size;
+    const times = real.map(t => t.time).filter(Boolean);
+    const when = times.length ? ` tussen ${fmtDay(Math.min(...times))} en ${fmtDay(Math.max(...times))}` : '';
+    if (ins.length || outs.length) {
+      out.push(`Het adres ontving ${ins.length ? assetText(sumAssets(ins)) + ` van ${s} afzender${s === 1 ? '' : 's'}` : 'niets'} en stuurde ${outs.length ? assetText(sumAssets(outs)) + ` naar ${r} ontvanger${r === 1 ? '' : 's'}` : 'niets door'}${when}${d.cursor ? ' (in de laatst geladen transacties)' : ''}.`);
+    } else out.push('Er zijn geen overboekingen met waarde gevonden.');
+    if (!outs.length && ins.length && !isEndpoint(n)) out.push('Er is (nog) niets doorgestuurd: het geld staat hier mogelijk nog.');
+    if (d.balance && !bal0(d.balance) && !isEndpoint(n)) out.push(`Er staat nu nog ${d.balance} op dit adres.`);
+  }
+  if (has('passthrough')) out.push('Geld bleef hier meestal korter dan een uur: typisch een doorsluisadres van oplichters.');
+  if (has('fanin') && !isEndpoint(n)) out.push('Veel verschillende mensen stuurden geld naar dit adres: mogelijk zijn er meer slachtoffers.');
+  if (has('startwallet')) out.push('Hier begint het geld voor zover te volgen: mogelijk een ander slachtoffer of de bron van het geld.');
+  if (has('seenbefore')) out.push('Dit adres kwam al voor in een eerder onderzoek op dit apparaat.');
+  if (n.ghost) out.push('Dit adres staat nog niet in je web. Tik op "Toevoegen aan web" om het mee te nemen in het rapport.');
+  else if (!isEndpoint(n) && !n.expanded && !n.seed) out.push('Tik op "Waar ging het geld heen?" om verder te zoeken.');
+  return out;
+}
+const fmtDay = t => t ? new Date(t * 1000).toLocaleDateString('nl-NL', { day: 'numeric', month: 'short', year: 'numeric' }) : '?';
+
+// --- de geldroute: van het startadres tot waar het geld uitkomt ---
+// Waarde van een geldstroom: dollars als bekend, anders BTC/ETH ruw omgerekend; onbekende tokens tellen niet.
+const NATIVE_USD = { BTC: 60000, ETH: 3000 };
+const edgeVal = e => e.usd || Object.entries(e.assets).reduce((s, [a, v]) => s + (NATIVE_USD[a] || 0) * v, 0);
+function moneyRoutes(max = 5) {
+  const seed = nodes.get(current?.seedKey);
+  if (!seed) return { routes: [], reached: false };
+  const all = [...edges.values()].filter(e => nodes.has(e.source) && nodes.has(e.target));
+  // Eerst alleen geld met waarde volgen (spam-tokens zonder koers vertroebelen de route); lukt dat niet, dan alles.
+  const valued = all.filter(e => edgeVal(e) > 0);
+  const r = routesOver(seed, valued, max);
+  return r.routes.length || valued.length === all.length ? r : routesOver(seed, all, max);
+}
+
+function routesOver(seed, list, max) {
+  const outs = new Map();
+  for (const e of list) {
+    if (!outs.has(e.source)) outs.set(e.source, []);
+    outs.get(e.source).push(e);
+  }
+  for (const l of outs.values()) l.sort((a, b) => edgeVal(b) - edgeVal(a));
+  const prev = new Map([[seed.key, null]]);
+  const q = [seed.key];
+  while (q.length) {
+    const k = q.shift();
+    if (k !== seed.key && isEndpoint(nodes.get(k))) continue;
+    for (const e of outs.get(k) || []) if (!prev.has(e.target)) { prev.set(e.target, e); q.push(e.target); }
+  }
+  const pathTo = k => { const steps = []; let e; while ((e = prev.get(k))) { steps.unshift(e); k = e.source; } return steps; };
+  let targets = [...prev.keys()].filter(k => k !== seed.key && isEndpoint(nodes.get(k)));
+  const reached = targets.length > 0;
+  if (!reached) targets = [...prev.keys()].filter(k => k !== seed.key && ![...prev.values()].some(e => e && e.source === k));
+  const routes = targets.map(k => ({ end: nodes.get(k), steps: pathTo(k) })).filter(r => r.steps.length)
+    .sort((a, b) => ((endKind(b.end) === 'exchange') - (endKind(a.end) === 'exchange'))
+      || (edgeVal(b.steps[b.steps.length - 1]) - edgeVal(a.steps[a.steps.length - 1])) || (a.steps.length - b.steps.length));
+  return { routes: routes.slice(0, max), reached, total: routes.length };
+}
+
+const whoIs = n => n.seed ? (current?.role === 'perp' ? 'de dader' : 'het slachtoffer')
+  : (labelOf(n) || `adres ${short(n.addr)}`) + ({ suspect: ' (verdacht)', perp: ' (dader)', sanction: ' (waarschuwingslijst)', victim2: ' (mogelijk slachtoffer)' }[nodeClass(n)] || '');
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+function stepText(e) {
+  const s = nodes.get(e.source), t = nodes.get(e.target);
+  const when = fmtDay(e.first) === fmtDay(e.last) ? fmtDay(e.first) : `${fmtDay(e.first)} t/m ${fmtDay(e.last)}`;
+  return { when, text: `${cap(whoIs(s))} stuurde ${edgeLabel(e)} naar ${whoIs(t)}.` };
+}
+const hasF = (n, c) => n.flags.some(f => f.code === c);
+const endKind = n => hasF(n, 'exchange') ? 'exchange' : hasF(n, 'mixer') ? 'mixer' : hasF(n, 'bridge') ? 'bridge'
+  : hasF(n, 'sanction') ? 'sanction' : hasF(n, 'contract') ? 'contract' : hasF(n, 'service') ? 'exchange' : null;
+const END_NL = { exchange: 'exchange', mixer: 'mixer', bridge: 'bridge', contract: 'smart contract', sanction: 'waarschuwingslijst' };
+
+function renderRoutes() {
+  const box = $('#routeBox');
+  const { routes, reached, total } = moneyRoutes();
+  box.hidden = !routes.length;
+  if (!routes.length) return;
+  const intro = reached
+    ? `<p class="hint">Zo is het geld gelopen tot waar het uitkwam${total > routes.length ? ` (de ${routes.length} grootste van ${total} routes)` : ''}. Tik op een stap om dat adres te bekijken.</p>`
+    : '<p class="hint">Het geld is in dit onderzoek nog niet bij een exchange aangekomen. Dit zijn de verste adressen. Tik op het laatste adres en kies "Waar ging het geld heen?" om verder te zoeken.</p>';
+  $('#routeList').innerHTML = intro + routes.map((r, i) => {
+    const kind = endKind(r.end);
+    const lab = labelOf(r.end);
+    const endName = lab || (kind ? 'een ' + END_NL[kind] : `adres ${short(r.end.addr)}`);
+    return `<div class="route-card ${kind || 'open'}">
+      <div class="route-h"><span class="route-n">${i + 1}</span> Eindigt bij <b>${esc(endName)}</b>${kind ? ` <button type="button" class="tag help" data-help="${kind}">${lab ? esc(END_NL[kind]) + ' ' : ''}?</button>` : ''}</div>
+      <ol class="route-steps">${r.steps.map(e => { const s = stepText(e); return `<li data-k="${esc(e.target)}"><small>${esc(s.when)}</small>${esc(s.text)}</li>`; }).join('')}</ol>
+      ${kind === 'exchange' ? `<button type="button" class="primary" data-letter="${esc(r.end.key)}">✉ Brief aan ${esc(exName(labelOf(r.end)) || 'deze exchange')} maken</button>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// --- brief aan een exchange (bevriezen + gegevens bewaren) ---
+let letterNode = null;
+function letterData(ex) {
+  const seed = nodes.get(current?.seedKey);
+  const inc = [...edges.values()].filter(e => e.target === ex.key && nodes.has(e.source));
+  const deposits = [...new Set(inc.map(e => e.source).filter(k => k !== seed?.key))].map(k => nodes.get(k).addr);
+  const txs = inc.flatMap(e => e.txs).sort((a, b) => (a.time || 0) - (b.time || 0)).slice(0, 25);
+  return { ex, name: exName(labelOf(ex)) || 'Exchange', seed, deposits, txs };
+}
+// "Binance: Hot Wallet 14" -> "Binance"
+const exName = s => { if (!s) return ''; const c = s.replace(/\s*[:|(–-].*$/, '').replace(/\s*(hot|cold|deposit)?\s*wallet.*$/i, '').replace(/\s+\d+$/, '').trim(); return c || s; };
+function letterText(d, f, lang) {
+  const chain = CHAIN_NAME[d.ex.chain];
+  const num = v => v.toLocaleString(lang === 'nl' ? 'nl-NL' : 'en-US', { maximumFractionDigits: 8 });
+  const txl = d.txs.map(t => `- ${utc(t.time)} | ${num(t.value)} ${t.asset} | tx ${t.txid}`).join('\n') || '-';
+  const dep = d.deposits.map(a => `- ${a}`).join('\n');
+  const cs = f.caseNo || '[zaaknummer]', nm = f.name || '[naam, organisatie]', ml = f.mail || '[e-mailadres]';
+  if (lang === 'nl') return `Onderwerp: Verzoek tot bevriezing van tegoeden en bewaren van gegevens – ${d.name} – zaak ${cs}
+
+Geachte afdeling Compliance / Law Enforcement van ${d.name},
+
+Wij onderzoeken een zaak van oplichting waarbij cryptovaluta van het slachtoffer zijn weggenomen. Uit blockchain-onderzoek blijkt dat het geld naar ${d.name} is gestuurd.
+
+Blockchain: ${chain}
+Adres van ${current?.role === 'perp' ? 'de vermoedelijke dader' : 'het slachtoffer'}: ${d.seed?.addr || '-'}
+Adres bij ${d.name} dat het geld ontving:
+- ${d.ex.addr}
+${dep ? `Mogelijk stortingsadres (deposit address) van uw klant:\n${dep}\n` : ''}
+Transacties:
+${txl}
+
+Wij verzoeken u vriendelijk:
+1. de tegoeden en het/de betrokken account(s) zo snel mogelijk te bevriezen;
+2. alle accountgegevens te bewaren (KYC/identiteit, IP-adressen, gekoppelde bankrekeningen, transactiegeschiedenis);
+3. ons te laten weten welke gegevens u kunt verstrekken en welke juridische procedure u daarvoor nodig heeft.
+
+Zaak- / aangiftenummer: ${cs}
+Contact: ${nm}, ${ml}
+
+Met vriendelijke groet,
+${nm}`;
+  return `Subject: Request to freeze funds and preserve account data – ${d.name} – case ${cs}
+
+Dear ${d.name} Compliance / Law Enforcement Response Team,
+
+We are investigating a fraud case in which cryptocurrency was taken from the victim. Blockchain analysis shows that the funds were sent to ${d.name}.
+
+Blockchain: ${chain}
+${current?.role === 'perp' ? 'Suspect' : 'Victim'} address: ${d.seed?.addr || '-'}
+Address at ${d.name} that received the funds:
+- ${d.ex.addr}
+${dep ? `Possible deposit address(es) of your customer:\n${dep}\n` : ''}
+Transactions:
+${txl}
+
+We kindly request that you:
+1. freeze the funds and the related account(s) as soon as possible;
+2. preserve all account data (KYC/identity, login IP addresses, linked bank accounts, transaction history);
+3. let us know which information you can provide and which legal procedure you require.
+
+Case / report number: ${cs}
+Contact: ${nm}, ${ml}
+
+Kind regards,
+${nm}`;
+}
+function openLetter(ex) {
+  if (!ex) return;
+  letterNode = ex;
+  const f = store.get('chaintrace.letter', {});
+  $('#lName').value = f.name || '';
+  $('#lMail').value = f.mail || '';
+  $('#lCase').value = (store.get('chaintrace.letterCase.' + current?.seedKey, null)) || '';
+  $('#letterTitle').textContent = `Brief aan ${exName(labelOf(ex)) || 'exchange'}`;
+  $('#lSearch').href = `https://www.google.com/search?q=${encodeURIComponent(`${exName(labelOf(ex)) || 'crypto exchange'} law enforcement request`)}`;
+  $('#lShare').hidden = !(window.AndroidBridge?.shareText || navigator.share);
+  fillLetter();
+  $('#letterDlg').showModal();
+}
+function fillLetter() {
+  if (!letterNode) return;
+  const f = { name: $('#lName').value.trim(), mail: $('#lMail').value.trim(), caseNo: $('#lCase').value.trim() };
+  store.set('chaintrace.letter', { name: f.name, mail: f.mail });
+  if (current) store.set('chaintrace.letterCase.' + current.seedKey, f.caseNo);
+  $('#lText').value = letterText(letterData(letterNode), f, $('#lLang').value);
+}
+function copyPlain(text) {
+  if (window.AndroidBridge?.writeClipboard) { window.AndroidBridge.writeClipboard(text); setStatus('Gekopieerd.'); return Promise.resolve(); }
+  return navigator.clipboard.writeText(text).then(() => setStatus('Gekopieerd.')).catch(() => prompt('Kopieer:', text));
+}
+
+// --- slim invoeren: adres of transactie uit willekeurige tekst halen ---
+function extractFromText(text) {
+  text = String(text || '');
+  const cands = [];
+  const re = /0x[a-fA-F0-9]{64}|0x[a-fA-F0-9]{40}|\bT[1-9A-HJ-NP-Za-km-z]{33}\b|\bbc1[a-zA-HJ-NP-Z0-9]{25,87}\b|\b[13][1-9A-HJ-NP-Za-km-z]{25,34}\b|\b[a-fA-F0-9]{64}\b/g;
+  let m;
+  while ((m = re.exec(text))) cands.push(m[0]);
+  for (const c of cands) { const a = /^bc1/i.test(c) ? c.toLowerCase() : c; if (detectChain(a)) return { kind: 'addr', value: a, chain: detectChain(a) }; }
+  for (const c of cands) if (/^(0x)?[a-fA-F0-9]{64}$/.test(c)) return { kind: 'tx', value: c.toLowerCase(), chain: c.startsWith('0x') ? 'eth' : null };
+  return null;
+}
+function smartFill(raw, source) {
+  const r = extractFromText(raw);
+  if (!r) return false;
+  $('#addr').value = r.value;
+  updateChainHint();
+  if (r.kind === 'tx') {
+    $('#chainHint').textContent = 'Dit is een transactie, geen adres. Tik op Start: je ziet dan wie betaalde en wie ontving, en tikt het adres aan dat je wilt onderzoeken.';
+    $('#chainHint').classList.remove('bad');
+  } else if (raw.trim() !== r.value) {
+    $('#chainHint').textContent = `✓ ${CHAIN_NAME[r.chain]}-adres gevonden in ${source === 'qr' ? 'de QR-code' : 'de tekst'}`;
+  }
+  return true;
+}
+async function readQrFromFile(file) {
+  if (!file || !window.jsQR) return null;
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await loadImage(url);
+    const s = Math.min(1, 1600 / Math.max(img.width, img.height));
+    const cv = document.createElement('canvas');
+    cv.width = Math.round(img.width * s); cv.height = Math.round(img.height * s);
+    const cx = cv.getContext('2d', { willReadFrequently: true });
+    cx.drawImage(img, 0, 0, cv.width, cv.height);
+    const data = cx.getImageData(0, 0, cv.width, cv.height);
+    return window.jsQR(data.data, cv.width, cv.height)?.data || null;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+function setupSimple() {
+  document.addEventListener('click', ev => {
+    const h = ev.target.closest('[data-help]');
+    if (h) { ev.preventDefault(); ev.stopPropagation(); showHelp(h.dataset.help); return; }
+    const l = ev.target.closest('[data-letter]');
+    if (l) { openLetter(nodes.get(l.dataset.letter)); return; }
+  }, true);
+  $('#btnHelpClose').addEventListener('click', () => $('#helpDlg').close());
+  $('#btnGlossary').addEventListener('click', showGlossary);
+  $('#routeList').addEventListener('click', ev => {
+    const li = ev.target.closest('li[data-k]');
+    if (!li) return;
+    focusNode(li.dataset.k);
+    openNode(nodes.get(li.dataset.k));
+  });
+  // brief
+  for (const id of ['#lName', '#lMail', '#lCase']) $(id).addEventListener('input', fillLetter);
+  $('#lLang').addEventListener('change', fillLetter);
+  $('#btnLetterClose').addEventListener('click', () => $('#letterDlg').close());
+  $('#lCopy').addEventListener('click', () => copyPlain($('#lText').value));
+  $('#lShare').addEventListener('click', () => {
+    const text = $('#lText').value, subject = text.split('\n')[0].replace(/^(Subject|Onderwerp): /, '');
+    if (window.AndroidBridge?.shareText) window.AndroidBridge.shareText(subject, text);
+    else navigator.share?.({ title: subject, text }).catch(() => {});
+  });
+  // grote letters
+  const applyBig = on => { document.body.classList.toggle('big', on); $('#btnBig').textContent = on ? 'Normale letters' : 'Grote letters'; setTimeout(() => cy?.resize(), 50); };
+  applyBig(!!store.get('chaintrace.big', false));
+  $('#btnBig').addEventListener('click', () => { const on = !document.body.classList.contains('big'); store.set('chaintrace.big', on); applyBig(on); });
+  // slim plakken en QR
+  $('#addr').addEventListener('paste', ev => {
+    const txt = ev.clipboardData?.getData('text') || '';
+    if (txt && !detectChain(txt.trim())) { ev.preventDefault(); if (!smartFill(txt, 'paste')) { $('#addr').value = txt.trim(); updateChainHint(); } }
+  });
+  $('#addr').addEventListener('blur', () => { const v = $('#addr').value; if (v && !detectChain(v.trim())) smartFill(v, 'paste'); });
+  $('#btnQr').addEventListener('click', () => $('#qrFile').click());
+  $('#qrFile').addEventListener('change', async ev => {
+    const f = ev.target.files[0];
+    ev.target.value = '';
+    if (!f) return;
+    setStatus('QR-code lezen…');
+    let txt = null;
+    try { txt = await readQrFromFile(f); } catch { /* onleesbaar */ }
+    if (txt && smartFill(txt, 'qr')) setStatus('');
+    else setStatus(txt ? `QR-code gelezen, maar er staat geen adres in: ${txt.slice(0, 60)}` : 'Geen QR-code gevonden. Probeer een scherpere foto, of knip alleen de QR-code uit.', true);
+  });
+}
+
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

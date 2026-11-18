@@ -101,7 +101,7 @@ window.PATTERNS = {
     focus: [],
     steps: [
       'Bekijk de bevindingen; rode en oranje adressen verdienen extra aandacht.',
-      'Klik op een adres en gebruik "Verder traceren" om dieper te gaan.',
+      'Klik op een adres en kies "Waar ging het geld heen?" om dieper te gaan.',
       'Exporteer het dossier en voeg het toe aan een aangifte.'
     ]
   }

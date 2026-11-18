@@ -322,3 +322,57 @@ textarea.note:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .steps { padding: 16px; }
 }
 .amt { flex: none; font-size: 13px; white-space: nowrap; }
+
+/* ---- eenvoud: uitleg, route, brief ---- */
+.qmark {
+  display: inline-grid; place-items: center; width: 20px; height: 20px; margin-left: 4px; border-radius: 50%; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--accent); font-size: 12px; font-weight: 700; cursor: pointer; vertical-align: 1px; padding: 0;
+}
+button.tag { font: inherit; font-size: 11px; color: inherit; cursor: pointer; }
+.tag.help i { font-style: normal; font-weight: 700; opacity: .75; margin-left: 2px; }
+.lg { background: none; border: 0; padding: 2px 0; color: inherit; font: inherit; cursor: pointer; }
+.lg:hover { color: var(--text); }
+.story {
+  margin: 10px 0; padding: 10px 12px; border-radius: var(--radius); border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, transparent); font-size: 13.5px; line-height: 1.5;
+}
+.story b { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--accent); margin-bottom: 4px; }
+.story p { margin: 0 0 6px; }
+.story p:last-child { margin-bottom: 0; }
+.xactions .letter { flex-basis: 100%; background: var(--exchange); color: #06210f; }
+.route-card { background: var(--panel-2); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; border-left: 4px solid var(--suspect); }
+.route-card.exchange { border-left-color: var(--exchange); }
+.route-card.mixer, .route-card.sanction { border-left-color: var(--sanction); }
+.route-card.bridge, .route-card.contract { border-left-color: var(--accent); }
+.route-h { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13.5px; margin-bottom: 6px; }
+.route-n { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--panel); font-size: 11px; font-weight: 700; }
+.route-steps { margin: 0 0 8px; padding-left: 20px; font-size: 13px; }
+.route-steps li { margin-bottom: 7px; cursor: pointer; }
+.route-steps li small { display: block; color: var(--muted); font-size: 11px; }
+.route-steps li:hover { color: var(--accent); }
+.route-card .primary { background: var(--exchange); color: #06210f; }
+.helpbody h2 { margin: 0 0 8px; font-size: 17px; }
+.helpbody h3 { margin: 14px 0 4px; font-size: 14px; color: var(--accent); }
+.helpbody p { margin: 0 0 6px; font-size: 14px; line-height: 1.55; }
+#helpDlg { max-height: calc(100vh - 48px); overflow-y: auto; }
+.lgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; margin-top: 10px; }
+.letter-text { font-family: ui-monospace, Consolas, monospace; font-size: 12px; min-height: 220px; }
+.lbtns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.lbtns > * { flex: 1 1 30%; text-align: center; text-decoration: none; width: auto; }
+#letterDlg { overflow-y: auto; }
+#letterDlg input[type=text] { font-family: inherit; }
+
+/* grote letters */
+body.big .panel, body.big .tabbar, body.big dialog, body.big .graph-tools, body.big .legend-wrap, body.big .peek { zoom: 1.2; }
+body.big .layout { grid-template-columns: 400px 1fr; }
+
+@media (max-width: 820px) {
+  .lgrid { grid-template-columns: 1fr; }
+  .lbtns > * { flex-basis: 100%; }
+  .qmark { width: 26px; height: 26px; font-size: 14px; }
+  #btnQr { min-width: 52px; }
+  .story { font-size: 15px; }
+  .route-steps { font-size: 14.5px; }
+  .dlg { width: calc(100vw - 16px); max-width: none; padding: 14px; }
+}
+.lbtns a.ghost { color: var(--text); display: flex; align-items: center; justify-content: center; }
