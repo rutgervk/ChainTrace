@@ -6,6 +6,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import java.util.Locale
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
@@ -34,6 +37,10 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var webView: WebView
     private var fileCallback: ValueCallback<Array<Uri>>? = null
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private val askNotify = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     private val pickFile = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         fileCallback?.onReceiveValue(uri?.let { arrayOf(it) } ?: emptyArray())
@@ -91,9 +98,48 @@ class MainActivity : ComponentActivity() {
 
         // De eerste periodieke run start direct; daarna elke 24 uur.
         OsintSyncWorker.scheduleDaily(this)
+        if (WatchStore.get(this).length > 2) WatchWorker.schedule(this)
 
-        if (savedInstanceState != null) webView.restoreState(savedInstanceState)
-        else webView.loadUrl("https://$APP_HOST/assets/index.html")
+        val watch = intent?.getStringExtra(EXTRA_WATCH)
+        if (savedInstanceState != null && watch == null) webView.restoreState(savedInstanceState)
+        else webView.loadUrl("https://$APP_HOST/assets/index.html" + (watch?.let { "?watch=" + Uri.encode(it) } ?: ""))
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val watch = intent.getStringExtra(EXTRA_WATCH) ?: return
+        webView.evaluateJavascript("window.ChainTraceOpenWatch && window.ChainTraceOpenWatch(${org.json.JSONObject.quote(watch)})", null)
+    }
+
+    override fun onDestroy() {
+        tts?.shutdown()
+        super.onDestroy()
+    }
+
+    /** Voorlezen in het Nederlands; lange teksten in stukjes (TTS heeft een maximum per stuk). */
+    private fun speakText(text: String) {
+        val go = {
+            val t = tts!!
+            t.stop()
+            val max = TextToSpeech.getMaxSpeechInputLength() - 100
+            val parts = text.split(Regex("(?<=[.!?])\\s+")).flatMap { it.chunked(max) }.filter { it.isNotBlank() }
+            parts.forEachIndexed { i, p ->
+                t.speak(p, if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, if (i == parts.lastIndex) "last" else "p$i")
+            }
+        }
+        if (tts != null && ttsReady) { go(); return }
+        tts = TextToSpeech(this) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS
+            if (!ttsReady) return@TextToSpeech
+            tts?.language = Locale("nl", "NL")
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) {}
+                override fun onError(id: String?) { done() }
+                override fun onDone(id: String?) { if (id == "last") done() }
+                private fun done() = runOnUiThread { webView.evaluateJavascript("window.ChainTraceSpeechDone && window.ChainTraceSpeechDone()", null) }
+            })
+            runOnUiThread { go() }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -108,6 +154,34 @@ class MainActivity : ComponentActivity() {
             val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
             cm.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString() ?: ""
         }.getOrDefault("")
+
+        @JavascriptInterface
+        fun speak(text: String) = runOnUiThread { speakText(text) }
+
+        @JavascriptInterface
+        fun stopSpeaking() = runOnUiThread { tts?.stop() }
+
+        @JavascriptInterface
+        fun getWatchlist(): String = WatchStore.get(this@MainActivity)
+
+        @JavascriptInterface
+        fun saveWatchlist(json: String) {
+            WatchStore.set(this@MainActivity, json)
+            if (json.length > 2) WatchWorker.schedule(this@MainActivity)
+        }
+
+        /** Eerste keer volgen: toestemming voor meldingen vragen en de controle plannen. */
+        @JavascriptInterface
+        fun watchEnabled() = runOnUiThread {
+            WatchWorker.ensureChannel(this@MainActivity)
+            if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                askNotify.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+            WatchWorker.schedule(this@MainActivity)
+        }
+
+        @JavascriptInterface
+        fun watchCheckNow() = WatchWorker.runNow(this@MainActivity)
 
         @JavascriptInterface
         fun writeClipboard(text: String) {
@@ -185,6 +259,7 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        const val EXTRA_WATCH = "watch"
         private const val TAG = "ChainTrace"
         private const val APP_HOST = "appassets.androidplatform.net"
     }

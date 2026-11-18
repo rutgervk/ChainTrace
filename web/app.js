@@ -6,13 +6,21 @@ const API = {
   btc: 'https://mempool.space/api',
   eth: 'https://eth.blockscout.com/api/v2',
   op: 'https://explorer.optimism.io/api/v2',
-  tron: 'https://api.trongrid.io'
+  tron: 'https://api.trongrid.io',
+  ltc: 'https://litecoinspace.org/api',
+  avax: 'https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api',
+  zksync: 'https://block-explorer-api.mainnet.zksync.io',
+  sol: 'https://solana-rpc.publicnode.com'
 };
-const CHAIN_NAME = { btc: 'Bitcoin', eth: 'Ethereum', op: 'Optimism', tron: 'Tron' };
-const OFAC_LISTS = { btc: ['XBT'], eth: ['ETH', 'USDT', 'USDC'], op: ['ETH', 'USDT', 'USDC'], tron: ['TRX', 'USDT'] };
+const CHAIN_NAME = { btc: 'Bitcoin', eth: 'Ethereum', op: 'Optimism', tron: 'Tron', ltc: 'Litecoin', avax: 'Avalanche', zksync: 'zkSync Era', sol: 'Solana' };
+const SYM = { btc: 'BTC', ltc: 'LTC', eth: 'ETH', op: 'ETH', zksync: 'ETH', avax: 'AVAX', sol: 'SOL', tron: 'TRX' };
+const EVM_LISTS = ['ETH', 'USDT', 'USDC'];
+const OFAC_LISTS = { btc: ['XBT'], ltc: ['LTC'], eth: EVM_LISTS, op: EVM_LISTS, avax: EVM_LISTS, zksync: EVM_LISTS, tron: ['TRX', 'USDT'], sol: ['SOL'] };
 const TRON_STABLES = { TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t: 'USDT', TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8: 'USDC' };
 const SERVICE_TX_THRESHOLD = 5000;
-const isEvm = c => c === 'eth' || c === 'op';
+const isEvm = c => c === 'eth' || c === 'op' || c === 'avax' || c === 'zksync';
+const isUtxo = c => c === 'btc' || c === 'ltc';
+const isBlockscout = c => c === 'eth' || c === 'op';
 
 // ---------- hulpfuncties ----------
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -34,6 +42,8 @@ function detectChain(a) {
   if (/^0x[a-fA-F0-9]{40}$/.test(a)) return 'eth';
   if (/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(a)) return 'tron';
   if (/^(bc1[a-z0-9]{25,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/.test(a)) return 'btc';
+  if (/^(ltc1[a-z0-9]{25,87}|[LM][1-9A-HJ-NP-Za-km-z]{26,33})$/.test(a)) return 'ltc';
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a)) return 'sol';
   return null;
 }
 
@@ -59,7 +69,7 @@ function dbLookup(n) {
   return dbCache.get(n.key);
 }
 function recordObservations() {
-  if (!LOCAL_DB || !current) return;
+  if (!LOCAL_DB || !current || demoMode) return;
   const seed = nodes.get(current.seedKey);
   if (!seed) return;
   try {
@@ -82,7 +92,7 @@ function acquire() { return new Promise(r => { if (running < MAX_PAR) { running+
 function release() { const next = waiting.shift(); if (next) next(); else running--; }
 
 // Minimale tijd tussen verzoeken per host; TronGrid zonder API-sleutel is streng.
-const HOST_GAP = { 'api.trongrid.io': 1050 }; // gemeten: ~1 verzoek/s wordt geaccepteerd
+const HOST_GAP = { 'api.trongrid.io': 1050, 'api.routescan.io': 550, 'solana-rpc.publicnode.com': 250 }; // gemeten: ~1 verzoek/s wordt geaccepteerd
 const hostNext = {};
 async function throttle(host) {
   const gap = HOST_GAP[host];
@@ -93,8 +103,9 @@ async function throttle(host) {
   if (at > now) await sleep(at - now);
 }
 
-function getData(url, asText = false, tries = 6) {
-  if (cache.has(url)) return cache.get(url);
+function getData(url, asText = false, tries = 6, body = null) {
+  const ck = body ? url + '|' + JSON.stringify(body) : url;
+  if (cache.has(ck)) return cache.get(ck);
   const host = new URL(url).host;
   const p = (async () => {
     await acquire();
@@ -108,7 +119,7 @@ function getData(url, asText = false, tries = 6) {
         let timedOut = false;
         const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, tries <= 2 ? 15000 : 30000);
         let r;
-        try { r = await fetch(url, { signal: ctl.signal }); }
+        try { r = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal } : { signal: ctl.signal }); }
         catch (err) { if (timedOut) throw new Error('Geen antwoord van ' + host); throw err; }
         finally { clearTimeout(timer); outer.removeEventListener('abort', onAbort); }
         if (r.status === 429 || r.status >= 500) {
@@ -123,8 +134,8 @@ function getData(url, asText = false, tries = 6) {
       throw new Error('Rate limit bij ' + new URL(url).host);
     } finally { release(); }
   })();
-  cache.set(url, p);
-  p.catch(() => cache.delete(url));
+  cache.set(ck, p);
+  p.catch(() => cache.delete(ck));
   return p;
 }
 
@@ -132,7 +143,7 @@ function getData(url, asText = false, tries = 6) {
 const osint = { ofac: new Set(), ofacLoaded: new Set(), scam: null };
 async function loadLists(chain) {
   // In de app staan deze lijsten (en meer) al in de lokale database.
-  if (LOCAL_DB && (dbStats()?.labels || 0) > 0) return;
+  if (demoMode || (LOCAL_DB && (dbStats()?.labels || 0) > 0)) return;
   await Promise.all(OFAC_LISTS[chain].map(async sym => {
     if (osint.ofacLoaded.has(sym)) return;
     const txt = await getData(`https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_${sym}.txt`, true).catch(() => null);
@@ -147,28 +158,29 @@ async function loadLists(chain) {
 }
 
 // ---------- ketenspecifiek ophalen → genormaliseerde transfers ----------
-async function fetchBtc(addr) {
+async function fetchBtc(addr, chain = 'btc') {
+  const B = API[chain];
   const [info, txs] = await Promise.all([
-    getData(`${API.btc}/address/${addr}`),
-    getData(`${API.btc}/address/${addr}/txs`)
+    getData(`${B}/address/${addr}`),
+    getData(`${B}/address/${addr}/txs`)
   ]);
   let all = txs || [];
   const conf = all.filter(t => t.status?.confirmed);
   let cursor = conf.length >= 25 ? { last: conf[conf.length - 1].txid } : null;
   if (cursor) {
-    const more = await getData(`${API.btc}/address/${addr}/txs/chain/${cursor.last}`).catch(() => null);
+    const more = await getData(`${B}/address/${addr}/txs/chain/${cursor.last}`).catch(() => null);
     if (more) { all = all.concat(more); cursor = more.length >= 25 ? { last: more[more.length - 1].txid } : null; }
   }
-  const { transfers, peelCount } = parseBtcTxs(addr, all);
+  const { transfers, peelCount } = parseBtcTxs(addr, all, SYM[chain]);
   const cs = info?.chain_stats;
   return {
     transfers, peelCount, meta: {}, cursor,
     txCount: cs?.tx_count ?? all.length,
-    balance: cs ? `${fmt((cs.funded_txo_sum - cs.spent_txo_sum) / 1e8)} BTC` : null
+    balance: cs ? `${fmt((cs.funded_txo_sum - cs.spent_txo_sum) / 1e8)} ${SYM[chain]}` : null
   };
 }
 
-function parseBtcTxs(addr, all) {
+function parseBtcTxs(addr, all, sym = 'BTC') {
   const transfers = [];
   let peelCount = 0;
   for (const tx of all) {
@@ -177,14 +189,14 @@ function parseBtcTxs(addr, all) {
     const time = tx.status?.block_time || Math.floor(Date.now() / 1000);
     if (ins.includes(addr)) {
       // uitgaand; outputs terug naar een input-adres behandelen we als wisselgeld
-      for (const o of outs) if (!ins.includes(o.a)) transfers.push({ from: addr, to: o.a, value: o.v, asset: 'BTC', time, txid: tx.txid });
+      for (const o of outs) if (!ins.includes(o.a)) transfers.push({ from: addr, to: o.a, value: o.v, asset: sym, time, txid: tx.txid });
       if (outs.length === 2) {
         const total = outs[0].v + outs[1].v;
         if (total > 0 && Math.max(outs[0].v, outs[1].v) / total >= 0.8) peelCount++;
       }
     } else {
       const recv = outs.filter(o => o.a === addr).reduce((s, o) => s + o.v, 0);
-      if (recv > 0) for (const i of ins) transfers.push({ from: i, to: addr, value: recv / ins.length, asset: 'BTC', time, txid: tx.txid });
+      if (recv > 0) for (const i of ins) transfers.push({ from: i, to: addr, value: recv / ins.length, asset: sym, time, txid: tx.txid });
     }
   }
   return { transfers, peelCount };
@@ -272,18 +284,24 @@ async function fetchTron(addr, fp) {
 const despam = d => { for (const t of d.transfers) if (t.value > 1e12) { t.dust = true; t.usd = null; } return d; };
 
 async function fetchAddr(chain, addr) {
-  const d = chain === 'btc' ? await fetchBtc(addr) : isEvm(chain) ? await fetchEvm(chain, addr) : await fetchTron(addr);
+  if (demoMode) return demoData(addr);
+  const d = isUtxo(chain) ? await fetchBtc(addr, chain) : isBlockscout(chain) ? await fetchEvm(chain, addr)
+    : chain === 'avax' ? await fetchRoutescan(chain, addr) : chain === 'zksync' ? await fetchZksync(addr)
+    : chain === 'sol' ? await fetchSol(addr) : await fetchTron(addr);
   // Absurde bedragen (bv. 2^256-"transfers" van nep-tokens) als spam behandelen.
   return despam(d);
 }
 
 // Volgende pagina transacties van een adres (voor de verkenner).
 async function fetchMore(chain, addr, cursor) {
-  if (!cursor) return null;
-  if (chain === 'btc') {
-    const more = await getData(`${API.btc}/address/${addr}/txs/chain/${cursor.last}`);
-    return despam({ ...parseBtcTxs(addr, more || []), meta: {}, cursor: (more || []).length >= 25 ? { last: more[more.length - 1].txid } : null });
+  if (!cursor || demoMode) return null;
+  if (isUtxo(chain)) {
+    const more = await getData(`${API[chain]}/address/${addr}/txs/chain/${cursor.last}`);
+    return despam({ ...parseBtcTxs(addr, more || [], SYM[chain]), meta: {}, cursor: (more || []).length >= 25 ? { last: more[more.length - 1].txid } : null });
   }
+  if (chain === 'avax') return despam(await fetchRoutescan(chain, addr, cursor.page));
+  if (chain === 'zksync') return despam(await fetchZksync(addr, cursor.page));
+  if (chain === 'sol') return despam(await fetchSol(addr, cursor.before));
   if (isEvm(chain)) {
     const B = API[chain];
     const qs = p => Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v ?? '')}`).join('&');
@@ -303,15 +321,40 @@ async function fetchTx(chain, txid) {
   const ck = chain + ':' + txid;
   if (txCache.has(ck)) return txCache.get(ck);
   let r;
-  if (chain === 'btc') {
-    const tx = await getData(`${API.btc}/tx/${txid}`);
+  const known = () => {
+    const transfers = [];
+    for (const n of [...nodes.values(), ...ghosts.values()]) for (const t of n.data?.transfers || []) {
+      if (t.txid === txid && !transfers.some(x => x.from === t.from && x.to === t.to && x.value === t.value)) transfers.push(t);
+    }
+    return { chain, txid, time: transfers[0]?.time || null, confirmed: true, transfers, partial: true };
+  };
+  if (demoMode) return known();
+  if (isUtxo(chain)) {
+    const tx = await getData(`${API[chain]}/tx/${txid}`);
+    if (!tx) return known();
+    const S = SYM[chain];
     r = {
-      chain, txid, time: tx.status?.block_time || null, confirmed: !!tx.status?.confirmed, fee: `${fmt(tx.fee / 1e8)} BTC`,
-      inputs: tx.vin.map(v => ({ addr: v.prevout?.scriptpubkey_address || (v.is_coinbase ? 'coinbase (nieuw gemunt)' : '?'), value: (v.prevout?.value || 0) / 1e8, asset: 'BTC', noLink: !v.prevout?.scriptpubkey_address })),
-      outputs: tx.vout.map(o => ({ addr: o.scriptpubkey_address || (o.scriptpubkey_type === 'op_return' ? 'OP_RETURN (data)' : o.scriptpubkey_type), value: o.value / 1e8, asset: 'BTC', noLink: !o.scriptpubkey_address }))
+      chain, txid, time: tx.status?.block_time || null, confirmed: !!tx.status?.confirmed, fee: `${fmt(tx.fee / 1e8)} ${S}`,
+      inputs: tx.vin.map(v => ({ addr: v.prevout?.scriptpubkey_address || (v.is_coinbase ? 'coinbase (nieuw gemunt)' : '?'), value: (v.prevout?.value || 0) / 1e8, asset: S, noLink: !v.prevout?.scriptpubkey_address })),
+      outputs: tx.vout.map(o => ({ addr: o.scriptpubkey_address || (o.scriptpubkey_type === 'op_return' ? 'OP_RETURN (data)' : o.scriptpubkey_type), value: o.value / 1e8, asset: S, noLink: !o.scriptpubkey_address }))
     };
+  } else if (chain === 'sol') {
+    const res = await getData(API.sol, false, 6, solRpc('getTransaction', [txid, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]));
+    const tx = res?.result;
+    if (!tx) return known();
+    r = { chain, txid, time: tx.blockTime || null, confirmed: true, failed: !!tx.meta?.err, fee: `${fmt((tx.meta?.fee || 0) / 1e9)} SOL`, transfers: solTransfers(tx, txid) };
+  } else if (chain === 'zksync') {
+    const [tx, tr] = await Promise.all([getData(`${API.zksync}/transactions/${txid}`), getData(`${API.zksync}/transactions/${txid}/transfers?limit=100`)]);
+    if (!tx) return known();
+    r = {
+      chain, txid, time: tx.receivedAt ? Date.parse(tx.receivedAt) / 1000 : null, confirmed: tx.status !== 'failed', failed: tx.status === 'failed',
+      from: tx.from?.toLowerCase(), to: tx.to?.toLowerCase(), transfers: (tr?.items || []).map(zkTransfer).filter(Boolean)
+    };
+  } else if (chain === 'avax') {
+    return known();
   } else if (isEvm(chain)) {
     const tx = await getData(`${API[chain]}/transactions/${txid}`);
+    if (!tx) return known();
     const v = Number(tx.value || 0) / 1e18;
     const transfers = [];
     if (v > 0) transfers.push({ from: tx.from?.hash?.toLowerCase(), to: tx.to?.hash?.toLowerCase(), value: v, asset: 'ETH' });
@@ -326,15 +369,150 @@ async function fetchTx(chain, txid) {
     };
   } else {
     // TronGrid heeft geen keyless tx-detail met tokentransfers: gebruik wat we al van adressen kennen.
-    const transfers = [];
-    for (const n of [...nodes.values(), ...ghosts.values()]) for (const t of n.data?.transfers || []) {
-      if (t.txid === txid && !transfers.some(x => x.from === t.from && x.to === t.to && x.value === t.value)) transfers.push(t);
-    }
-    r = { chain, txid, time: transfers[0]?.time || null, confirmed: true, transfers, partial: true };
-    return r; // niet cachen: kan aanvullen naarmate meer adressen geladen zijn
+    return known(); // niet cachen: kan aanvullen naarmate meer adressen geladen zijn
   }
   txCache.set(ck, r);
   return r;
+}
+
+// ---------- extra ketens: Avalanche (Routescan), zkSync Era, Solana ----------
+const rsArr = r => Array.isArray(r?.result) ? r.result : [];
+const AVAX_STABLES = { '0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e': 'USDC', '0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7': 'USDT', '0xa7d7079b0fead91f3e65f86e8915cb59c1a4c664': 'USDC.e', '0xc7198437980c041c805a1edcba50c1ce5db95118': 'USDT.e' };
+const STABLE_RE = /^(USDT|USDC|USDC\.e|USDT\.e|USDt|DAI|TUSD|BUSD)$/i;
+
+async function fetchRoutescan(chain, addr, page = 1) {
+  const B = API[chain];
+  const q = action => `${B}?module=account&action=${action}&address=${addr}&page=${page}&offset=100&sort=desc`;
+  const [txs, tts, bal] = await Promise.all([
+    getData(q('txlist')), getData(q('tokentx')),
+    page === 1 ? getData(`${B}?module=account&action=balance&address=${addr}`, false, 2).catch(() => null) : null
+  ]);
+  const transfers = [];
+  for (const t of rsArr(txs)) {
+    const v = Number(t.value) / 1e18;
+    if (!(v > 0) || t.isError === '1' || !t.to) continue;
+    transfers.push({ from: t.from.toLowerCase(), to: t.to.toLowerCase(), value: v, asset: SYM[chain], time: Number(t.timeStamp), txid: t.hash });
+  }
+  for (const t of rsArr(tts)) {
+    const v = Number(t.value) / 10 ** Number(t.tokenDecimal || 18);
+    const sym = t.tokenSymbol || '?';
+    const real = AVAX_STABLES[(t.contractAddress || '').toLowerCase()];
+    transfers.push({
+      from: t.from.toLowerCase(), to: t.to.toLowerCase(), value: v, asset: real || sym, time: Number(t.timeStamp), txid: t.hash,
+      usd: real ? v : null, dust: v === 0 || (!real && STABLE_RE.test(sym))
+    });
+  }
+  const full = rsArr(txs).length >= 100 || rsArr(tts).length >= 100;
+  return {
+    transfers, meta: {}, txCount: null, cursor: full ? { page: page + 1 } : null,
+    balance: bal?.result != null && /^\d+$/.test(bal.result) ? `${fmt(Number(bal.result) / 1e18)} ${SYM[chain]}` : null
+  };
+}
+
+function zkTransfer(t) {
+  if (!t || t.type === 'fee' || !t.from || !t.to) return null;
+  const tok = t.token || {};
+  const v = Number(t.amount || 0) / 10 ** Number(tok.decimals ?? 18);
+  const sym = tok.symbol || '?';
+  const priced = tok.usdPrice && (tok.liquidity || 0) > 100000;
+  return {
+    from: t.from.toLowerCase(), to: t.to.toLowerCase(), value: v, asset: sym.length > 12 ? sym.slice(0, 12) + '…' : sym,
+    time: Date.parse(t.timestamp) / 1000, txid: t.transactionHash, usd: priced ? v * tok.usdPrice : null,
+    dust: v === 0 || (!priced && (STABLE_RE.test(sym) || /claim|visit|reward|\.(site|com|io|xyz)/i.test(sym)))
+  };
+}
+async function fetchZksync(addr, page = 1) {
+  const B = API.zksync;
+  const [tr, info] = await Promise.all([
+    getData(`${B}/address/${addr}/transfers?limit=100&page=${page}`),
+    page === 1 ? getData(`${B}/address/${addr}`, false, 2).catch(() => null) : null
+  ]);
+  const transfers = (tr?.items || []).map(zkTransfer).filter(Boolean);
+  const eth = info?.balances && Object.values(info.balances).find(b => b.token?.symbol === 'ETH');
+  return {
+    transfers, meta: {}, txCount: tr?.meta?.totalItems || null,
+    cursor: tr?.meta && tr.meta.currentPage < tr.meta.totalPages ? { page: page + 1 } : null,
+    balance: eth ? `${fmt(Number(eth.balance) / 1e18)} ETH` : null
+  };
+}
+
+// Solana: handtekeningen per adres, daarna de transacties in één batch-verzoek.
+const SOL_MINTS = { EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: 'USDC', Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: 'USDT', So11111111111111111111111111111111111111112: 'wSOL' };
+const solRpc = (method, params) => ({ jsonrpc: '2.0', id: 1, method, params });
+function solTransfers(tx, sig) {
+  if (!tx) return [];
+  const keys = tx.transaction.message.accountKeys.map(k => k.pubkey || k);
+  const tok = {};
+  for (const b of [...(tx.meta?.preTokenBalances || []), ...(tx.meta?.postTokenBalances || [])]) {
+    tok[keys[b.accountIndex]] = { owner: b.owner, mint: b.mint, dec: b.uiTokenAmount?.decimals ?? 0 };
+  }
+  const ins = [...tx.transaction.message.instructions, ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions)];
+  const out = [];
+  const time = tx.blockTime || Math.floor(Date.now() / 1000);
+  for (const i of ins) {
+    const p = i.parsed, info = p?.info;
+    if (!info) continue;
+    if (i.program === 'system' && (p.type === 'transfer' || p.type === 'transferWithSeed') && info.lamports > 0) {
+      out.push({ from: info.source, to: info.destination, value: info.lamports / 1e9, asset: 'SOL', time, txid: sig });
+    } else if (i.program === 'spl-token' && (p.type === 'transfer' || p.type === 'transferChecked')) {
+      const src = tok[info.source], dst = tok[info.destination];
+      const mint = info.mint || src?.mint || dst?.mint;
+      const dec = info.tokenAmount?.decimals ?? src?.dec ?? dst?.dec ?? 0;
+      const v = info.tokenAmount ? Number(info.tokenAmount.uiAmount || 0) : Number(info.amount || 0) / 10 ** dec;
+      const sym = SOL_MINTS[mint] || (mint ? mint.slice(0, 4) + '…' : '?');
+      const real = sym === 'USDC' || sym === 'USDT';
+      out.push({
+        from: src?.owner || info.authority || info.multisigAuthority || info.source, to: dst?.owner || info.destination,
+        value: v, asset: sym, time, txid: sig, usd: real ? v : null, dust: v === 0
+      });
+    }
+  }
+  return out.filter(t => t.from && t.to && t.from !== t.to);
+}
+async function fetchSol(addr, before) {
+  const B = API.sol;
+  const opts = { limit: 20 };
+  if (before) opts.before = before;
+  const [sigRes, balRes] = await Promise.all([
+    getData(B, false, 6, solRpc('getSignaturesForAddress', [addr, opts])),
+    before ? null : getData(B, false, 2, solRpc('getBalance', [addr])).catch(() => null)
+  ]);
+  const sigs = (sigRes?.result || []).filter(s => !s.err);
+  let txs = [];
+  if (sigs.length) {
+    // De gratis RPC staat geen batches met getTransaction toe: één voor één (getempo via HOST_GAP).
+    txs = await Promise.all(sigs.map(x => getData(B, false, 4, solRpc('getTransaction', [x.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]))
+      .then(r => r?.result || null).catch(() => null)));
+  }
+  const transfers = [];
+  sigs.forEach((s, i) => { for (const t of solTransfers(txs[i], s.signature)) if (t.from === addr || t.to === addr) transfers.push(t); });
+  const all = sigRes?.result || [];
+  return {
+    transfers, meta: {}, txCount: null,
+    cursor: all.length >= 20 ? { before: all[all.length - 1].signature } : null,
+    balance: balRes?.result?.value != null ? `${fmt(balRes.result.value / 1e9)} SOL` : null
+  };
+}
+
+// Welke EVM-keten? Een 0x-adres kan op meerdere ketens bestaan: tel snel de activiteit per keten.
+async function probeEvm(addr) {
+  // Blockscout telt zeer drukke adressen niet (geeft 0): dan kijken of er transacties zijn.
+  const bsCount = async c => {
+    const k = await getData(`${API[c]}/addresses/${addr}/counters`, false, 2).catch(() => null);
+    const n = Number(k?.transactions_count || 0) + Number(k?.token_transfers_count || 0);
+    if (n) return n;
+    const t = await getData(`${API[c]}/addresses/${addr}/transactions`, false, 2).catch(() => null);
+    return t?.items?.length ? -1 : 0;
+  };
+  const probes = {
+    eth: () => bsCount('eth'),
+    op: () => bsCount('op'),
+    avax: () => getData(`${API.avax}?module=account&action=txlist&address=${addr}&page=1&offset=1`, false, 2).then(r => rsArr(r).length ? -1 : 0),
+    zksync: () => getData(`${API.zksync}/address/${addr}/transfers?limit=1`, false, 2).then(r => Number(r?.meta?.totalItems || 0))
+  };
+  const out = {};
+  await Promise.all(Object.entries(probes).map(async ([c, f]) => { try { out[c] = await f(); } catch { out[c] = 0; } }));
+  return Object.keys(probes).filter(c => out[c]).map(chain => ({ chain, count: out[chain] }));
 }
 
 // ---------- grafiekmodel ----------
@@ -481,7 +659,7 @@ function fullAnalyze(n) {
 const isEndpoint = n => n.flags.some(f => ['exchange', 'service', 'mixer', 'sanction', 'contract', 'bridge'].includes(f.code));
 
 function fingerprint(chain, a) {
-  const s = isEvm(chain) ? a.toLowerCase().slice(2) : chain === 'tron' ? a.slice(1) : a.replace(/^bc1/, '');
+  const s = isEvm(chain) ? a.toLowerCase().slice(2) : chain === 'tron' ? a.slice(1) : a.replace(/^(bc1|ltc1)/, '');
   return s.slice(0, 4) + '|' + s.slice(-4);
 }
 
@@ -561,7 +739,7 @@ async function expand(n, depth, dir) {
     if (dir !== 'both' && d !== dir) continue;
     const k = d + '|' + cp;
     const a = agg.get(k) || { d, cp, rank: 0, count: 0, dustOnly: true, list: [] };
-    a.rank += t.usd ?? (n.chain === 'btc' ? t.value : 0);
+    a.rank += t.usd ?? (isUtxo(n.chain) ? t.value : 0);
     a.count++;
     if (!t.dust) a.dustOnly = false;
     a.list.push(t);
@@ -606,6 +784,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   abortCtl = new AbortController();
   stopped = false;
   resetGraph();
+  demoMode = norm(chain, addr) === DEMO.victim || norm(chain, addr) === DEMO.scammer;
   current = { chain, role, pattern, opts, seedKey: keyOf(chain, addr), started: new Date().toISOString() };
   dbCache.clear();
   loadNotes();
@@ -697,9 +876,9 @@ async function originStep({ n, hop, child }, root, depth, fanIn, seen, sent, lim
   for (const t of d.transfers) {
     if (t.to !== n.addr || t.from === n.addr || t.dust) continue;
     // Alleen geld met waarde volgen: onbekende tokens zonder koers zijn meestal spam/airdrops.
-    if (n.chain !== 'btc' && t.usd == null) continue;
+    if (!isUtxo(n.chain) && t.usd == null) continue;
     const a = agg.get(t.from) || { cp: t.from, rank: 0, list: [] };
-    a.rank += t.usd ?? (n.chain === 'btc' ? t.value : 0);
+    a.rank += t.usd ?? (isUtxo(n.chain) ? t.value : 0);
     a.list.push(t);
     agg.set(t.from, a);
   }
@@ -724,7 +903,8 @@ async function originStep({ n, hop, child }, root, depth, fanIn, seen, sent, lim
 }
 
 function txUrl(chain, id) {
-  return { btc: `https://mempool.space/tx/${id}`, eth: `https://etherscan.io/tx/${id}`, op: `https://optimistic.etherscan.io/tx/${id}`, tron: `https://tronscan.org/#/transaction/${id}` }[chain];
+  return { btc: `https://mempool.space/tx/${id}`, eth: `https://etherscan.io/tx/${id}`, op: `https://optimistic.etherscan.io/tx/${id}`, tron: `https://tronscan.org/#/transaction/${id}`,
+    ltc: `https://litecoinspace.org/tx/${id}`, avax: `https://snowtrace.io/tx/${id}`, zksync: `https://explorer.zksync.io/tx/${id}`, sol: `https://solscan.io/tx/${id}` }[chain];
 }
 
 const assetText = assets => Object.entries(assets).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([s, v]) => `${fmt(v)} ${s}`).join(' + ') || '—';
@@ -788,7 +968,8 @@ const COLORS = { victim: '#3fa7ff', victim2: '#8cc8ff', perp: '#ff4d5e', suspect
 
 function nodeClass(n) {
   if (n.role) return n.role;
-  if (n.flags.some(f => ['sanction', 'scamlist', 'mixer', 'badtag', 'ransomware', 'frozen', 'darknet'].includes(f.code))) return 'sanction';
+  const badC = n.flags.filter(f => ['sanction', 'scamlist', 'mixer', 'badtag', 'ransomware', 'frozen', 'darknet'].includes(f.code)).map(f => f.code);
+  if (badC.length && !(badC.every(c => c === 'frozen') && n.flags.some(f => f.code === 'exchange'))) return 'sanction';
   if (n.flags.some(f => f.code === 'seenbefore' && f.level === 'high')) return 'suspect';
   if (n.flags.some(f => f.code === 'lookalike' && f.level === 'high')) return 'perp';
   if (n.flags.some(f => ['exchange', 'service'].includes(f.code))) return 'exchange';
@@ -950,8 +1131,12 @@ function osintLinks(n) {
     btc: [['mempool.space', `https://mempool.space/address/${a}`], ['Blockchair', `https://blockchair.com/bitcoin/address/${a}`], ['OXT', `https://oxt.me/address/${a}`]],
     eth: [['Etherscan', `https://etherscan.io/address/${a}`], ['Blockscout', `https://eth.blockscout.com/address/${a}`]],
     op: [['Optimism explorer', `https://explorer.optimism.io/address/${a}`], ['OP Etherscan', `https://optimistic.etherscan.io/address/${a}`]],
-    tron: [['Tronscan', `https://tronscan.org/#/address/${a}`]]
-  }[n.chain];
+    tron: [['Tronscan', `https://tronscan.org/#/address/${a}`]],
+    ltc: [['litecoinspace', `https://litecoinspace.org/address/${a}`], ['Blockchair', `https://blockchair.com/litecoin/address/${a}`]],
+    avax: [['Snowtrace', `https://snowtrace.io/address/${a}`]],
+    zksync: [['zkSync explorer', `https://explorer.zksync.io/address/${a}`]],
+    sol: [['Solscan', `https://solscan.io/account/${a}`], ['Solana Explorer', `https://explorer.solana.com/address/${a}`]]
+  }[n.chain] || [];
   return [
     ...ex,
     ['Chainabuse', `https://www.chainabuse.com/address/${a}`],
@@ -1106,7 +1291,7 @@ function addrViewHtml(v) {
       <div class="mono">${esc(n.addr)} <button type="button" class="mini" data-act="copy">Kopieer</button></div></div></div>
     <div class="tags"><span class="tag">${CHAIN_NAME[n.chain]}</span><button type="button" class="tag help" data-help="${cls}">${ROLE_TXT[cls]} <i>?</i></button>${n.ghost ? '<span class="tag">Niet in het web</span>' : ''}
       ${n.flags.filter(f => f.code !== 'error').map(f => HELP[f.code] ? `<button type="button" class="tag help ${f.level}" data-help="${f.code}">${esc(f.text)} <i>?</i></button>` : `<span class="tag ${f.level}">${esc(f.text)}</span>`).join('')}</div>
-    ${(() => { const st = plainStory(n); return st.length ? `<div class="story"><b>In gewone taal</b>${st.map(x => `<p>${esc(x)}</p>`).join('')}</div>` : ''; })()}
+    ${(() => { const st = plainStory(n); return st.length ? `<div class="story" data-speak-box><div class="story-h"><b>In gewone taal</b>${speakBtn('self')}</div>${st.map(x => `<p>${esc(x)}</p>`).join('')}</div>` : ''; })()}
     <div class="xstats">
       <div><span>Saldo</span><b>${esc(d?.balance || '—')}</b></div>
       <div><span>Transacties</span><b>${d?.txCount ? fmt(d.txCount) : d ? fmt(d.transfers.length) + (d.cursor ? '+' : '') : '…'}</b></div>
@@ -1119,6 +1304,7 @@ function addrViewHtml(v) {
       ${endKind(n) === 'exchange' && !n.ghost ? `<button type="button" class="primary letter" data-letter="${esc(n.key)}">✉ Brief aan ${esc(exName(labelOf(n)) || 'deze exchange')}</button>` : ''}
       <button type="button" class="ghost" data-act="expand">Waar ging het geld heen?</button>
       <button type="button" class="ghost" data-act="origins">Waar kwam het vandaan?</button>
+      <button type="button" class="ghost ${isWatched(n) ? 'watching' : ''}" data-act="watch">${isWatched(n) ? '🔕 Niet meer volgen' : '🔔 Volg dit adres'}</button>
       <details class="menu xmore"><summary class="ghost">Meer…</summary><div class="menu-items">
         <button type="button" data-act="perp">${n.role === 'perp' ? 'Dader-markering weghalen' : 'Markeer als dader'}</button>
         <button type="button" data-act="victim">${n.role === 'victim' ? 'Slachtoffer-markering weghalen' : 'Markeer als slachtoffer'}</button>
@@ -1171,7 +1357,7 @@ function cpListHtml(n, v) {
     const cp = dir === 'out' ? t.to : t.from;
     const a = agg.get(cp) || { cp, in: [], out: [], usd: 0, last: 0 };
     a[dir].push(t);
-    a.usd += t.usd || (n.chain === 'btc' ? t.value * 1e4 : 0);
+    a.usd += t.usd || (isUtxo(n.chain) ? t.value * 1e4 : 0);
     a.last = Math.max(a.last, t.time || 0);
     agg.set(cp, a);
   }
@@ -1222,17 +1408,17 @@ function txViewHtml(v) {
   if (v.err) return `${head}<p class="muted">Ophalen mislukt: ${esc(v.err)}</p><button type="button" class="ghost wide" data-act="retrytx">Opnieuw proberen</button>`;
   if (!r) return `${head}<div class="xloading"><span class="spin"></span> Transactie ophalen…</div>`;
   const status = r.failed ? '<span class="tag high">Mislukt</span>' : r.confirmed ? '<span class="tag info">Bevestigd</span>' : '<span class="tag med">Onbevestigd</span>';
-  const ext = `<div class="links"><a href="${esc(txUrl(r.chain, r.txid))}" target="_blank" rel="noopener noreferrer">Bekijk op ${r.chain === 'btc' ? 'mempool.space' : r.chain === 'tron' ? 'Tronscan' : 'Etherscan'}</a></div>`;
+  const ext = `<div class="links"><a href="${esc(txUrl(r.chain, r.txid))}" target="_blank" rel="noopener noreferrer">Bekijk op ${({ btc: 'mempool.space', ltc: 'litecoinspace', tron: 'Tronscan', avax: 'Snowtrace', zksync: 'zkSync explorer', sol: 'Solscan', op: 'OP Etherscan' })[r.chain] || 'Etherscan'}</a></div>`;
   let body = '';
-  if (r.chain === 'btc') {
+  if (isUtxo(r.chain) && r.inputs) {
     const io = (list, title) => `<h4>${title} <span class="badge">${list.length}</span></h4>
-      ${list.map(x => `<div class="xrow"><div class="xrow-top">${addrChip('btc', x.addr, { noLink: x.noLink })}<b class="amt">${fmt(x.value)} BTC</b></div></div>`).join('')}`;
+      ${list.map(x => `<div class="xrow"><div class="xrow-top">${addrChip(r.chain, x.addr, { noLink: x.noLink })}<b class="amt">${fmt(x.value)} ${SYM[r.chain]}</b></div></div>`).join('')}`;
     body = `<div class="xio"><div>${io(r.inputs, 'Van (inputs)')}</div><div>${io(r.outputs, 'Naar (outputs)')}</div></div>`;
   } else {
     body = `${r.from ? `<h4>Afzender → ontvanger</h4><div class="xrow"><div class="xrow-top">${addrChip(r.chain, r.from)}</div><div class="xrow-top">→ ${addrChip(r.chain, r.to)}</div></div>` : ''}
       <h4>Overboekingen <span class="badge">${r.transfers.length}</span></h4>
       ${r.transfers.map(t => `<div class="xrow"><div class="xrow-top">${addrChip(r.chain, t.from)}</div><div class="xrow-top">→ ${addrChip(r.chain, t.to)}</div><div class="xrow-sub"><b>${fmt(t.value)} ${esc(t.asset)}</b></div></div>`).join('') || '<p class="muted">Geen waarde-overboekingen.</p>'}
-      ${r.partial ? '<p class="hint">Tron: alleen overboekingen van adressen die de app al geladen heeft. Zie Tronscan voor alles.</p>' : ''}`;
+      ${r.partial ? '<p class="hint">Hier staan alleen de overboekingen van adressen die de app al geladen heeft. Gebruik de link hieronder voor de volledige transactie.</p>' : ''}`;
   }
   return `${head}
     <div class="tags"><span class="tag">${CHAIN_NAME[r.chain]}</span>${status}</div>
@@ -1341,6 +1527,7 @@ async function nodeAction(n, act) {
   if (act === 'copy') return copyText(n.addr);
   if (act === 'retry') { n.loadTried = false; n.flags = n.flags.filter(f => f.code !== 'error'); return refreshView(); }
   if (act === 'show') { setTab('graph'); focusNode(n.key); return; }
+  if (act === 'watch') { await toggleWatch(n); refreshView(); return; }
   if (act === 'add') { ensureCase(n); addToGraph(n); setStatus('Toegevoegd aan het web.'); return refreshView(); }
   if (n.ghost && ['perp', 'victim', 'expand', 'origins'].includes(act)) { ensureCase(n); n = addToGraph(n); }
   if (act === 'perp' || act === 'victim') { n.role = n.role === act ? null : act; render(false); refreshView(); recordObservations(); return; }
@@ -1404,7 +1591,8 @@ function exploreQuery(q) {
     return openAddr(chain, q);
   }
   if (/^0x[0-9a-fA-F]{64}$/.test(q)) return openTx(current && isEvm(current.chain) ? current.chain : 'eth', q.toLowerCase());
-  if (/^[0-9a-fA-F]{64}$/.test(q)) return openTx(current?.chain === 'tron' ? 'tron' : 'btc', q.toLowerCase());
+  if (/^[0-9a-fA-F]{64}$/.test(q)) return openTx(['tron', 'ltc'].includes(current?.chain) ? current.chain : 'btc', q.toLowerCase());
+  if (/^[1-9A-HJ-NP-Za-km-z]{86,88}$/.test(q)) return openTx('sol', q);
   setStatus('Niet herkend als adres of transactie-hash.', true);
   setTab('form');
 }
@@ -1426,7 +1614,8 @@ const stamp = () => new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
 
 function exportJson() {
   const seed = nodes.get(current?.seedKey);
-  const dossier = {
+  const dossier = buildDossier();
+  const unused = {
     tool: 'ChainTrace', version: 1, exported: new Date().toISOString(),
     case: current && { chain: current.chain, role: current.role, pattern: window.PATTERNS[current.pattern].name, patternKey: current.pattern, seed: seed?.addr, started: current.started },
     nodes: [...nodes.values()].map(n => ({ key: n.key, chain: n.chain, address: n.addr, label: labelOf(n), role: n.role, classification: nodeClass(n), hop: n.depth, flags: n.flags, seed: !!n.seed, hint: n.hint, parent: n.parent, upstream: !!n.upstream })),
@@ -1655,6 +1844,8 @@ function summaryLines() {
 }
 
 function renderSummary() {
+  autosave();
+  renderDemoBanner();
   const lines = summaryLines();
   $('#summary').hidden = !lines.length;
   $('#summaryList').innerHTML = lines.map(l => `<li class="${l.cls || ''}">${esc(l.text)}</li>`).join('');
@@ -1839,10 +2030,25 @@ async function exportPdf() {
   }
 }
 
-function importJson(text) {
-  const d = JSON.parse(text);
+function importJson(text, { merge = false } = {}) {
+  const d = typeof text === 'string' ? JSON.parse(text) : text;
   if (d.tool !== 'ChainTrace') throw new Error('Geen ChainTrace-dossier');
+  if (merge && current) {
+    // Samenvoegen in het huidige web (zaak: meerdere onderzoeken samen).
+    for (const x of d.nodes) {
+      const isNew = !nodes.has(x.key);
+      const n = getNode(x.chain, x.address);
+      if (isNew) Object.assign(n, { flags: x.flags || [], depth: x.hop, hint: x.hint, parent: x.parent, upstream: x.upstream, expanded: true });
+      else for (const f of x.flags || []) addFlag(n, f.code, f.level, f.text);
+      if (x.seed && !n.role) n.role = d.case?.role || 'victim';
+      else if (x.role && !n.role) n.role = x.role;
+      if (x.label && !labelOf(n)) metaStore[n.key] = { ...(metaStore[n.key] || {}), tags: [x.label] };
+    }
+    for (const e of d.edges) if (!edges.has(e.key)) edges.set(e.key, { ...e, first: e.first ?? Infinity });
+    return;
+  }
   abortCtl.abort(); abortCtl = new AbortController();
+  demoMode = false;
   resetGraph();
   current = { chain: d.case?.chain || d.nodes[0]?.chain, role: d.case?.role || 'victim', pattern: d.case?.patternKey || 'generic',
     seedKey: d.nodes.find(n => n.seed)?.key, started: d.case?.started, opts: readOpts() };
@@ -1850,6 +2056,7 @@ function importJson(text) {
   for (const x of d.nodes) {
     const n = getNode(x.chain, x.address);
     Object.assign(n, { role: x.role, flags: x.flags || [], seed: x.seed, depth: x.hop, hint: x.hint, parent: x.parent, upstream: x.upstream, expanded: true });
+    if (x.label && !labelOf(n)) metaStore[n.key] = { ...(metaStore[n.key] || {}), tags: [x.label] };
   }
   for (const e of d.edges) edges.set(e.key, { ...e, first: e.first ?? Infinity });
   origins.rootKey = d.origins?.rootKey || null;
@@ -1950,7 +2157,20 @@ function setup() {
     if (det && (isEvm(det) !== isEvm(chain) || (!isEvm(det) && det !== chain))) { setStatus(`Adres past niet bij ${CHAIN_NAME[chain]}.`, true); return; }
     const role = document.querySelector('input[name=role]:checked').value;
     const pattern = $('#pattern').value;
+    const resubmit = () => { const e = new Event('submit', { cancelable: true }); e.chainPicked = true; $('#traceForm').dispatchEvent(e); };
     try { history.replaceState(null, '', `?addr=${encodeURIComponent(addr)}&chain=${chain}&role=${role}&pattern=${pattern}`); } catch { /* file:// */ }
+    if ($('#chain').value === 'auto' && det === 'eth' && norm('eth', addr) !== DEMO.victim && !ev.chainPicked) {
+      setStatus('Kijken op welke blockchain dit adres actief is…');
+      probeEvm(addr).then(found => {
+        if (found.length <= 1) { $('#chain').value = found[0]?.chain || 'eth'; resubmit(); $('#chain').value = 'auto'; return; }
+        setStatus('');
+        $('#chainPick').hidden = false;
+        $('#chainPick').innerHTML = `<p>Dit adres is actief op meerdere blockchains. Welke wil je onderzoeken?</p>${found.map(f =>
+          `<button type="button" class="ghost" data-pick="${f.chain}">${esc(CHAIN_NAME[f.chain])}${f.count > 0 ? ` · ${fmt(f.count)} tx` : ''}</button>`).join('')}`;
+      });
+      return;
+    }
+    $('#chainPick').hidden = true;
     if (isMobile()) setTab('graph');
     runTrace(addr, chain, role, pattern, readOpts()).catch(err => {
       setBusy(false);
@@ -1984,6 +2204,7 @@ function setup() {
 
   setupDbDialog();
   setupSimple();
+  setupFeatures();
 
   // Tabbalk (telefoon), zoeken in de verkenner en het kaartje onder in het web.
   document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
@@ -2091,6 +2312,7 @@ const HELP = {
   lookalike: ['Lijkt-op-adres (address poisoning)', 'Oplichters maken een adres dat aan het begin en eind hetzelfde is als een adres dat je vaker gebruikt. Wie dan een adres uit de geschiedenis kopieert, stuurt het geld per ongeluk naar de oplichter. Vergelijk daarom altijd het hele adres.'],
   dust: ['Spam / nul-transacties', 'Overboekingen van 0 of met nepmunten. Vaak bedoeld om een lijkt-op-adres in de geschiedenis van het slachtoffer te zetten.'],
   seenbefore: ['Eerder gezien', 'Dit adres kwam al voor in een ander onderzoek op dit apparaat.'],
+  overlap: ['Komt vaker voor', 'Dit adres komt voor in meerdere onderzoeken van dezelfde zaak. Dat is een belangrijk verband: bijvoorbeeld dezelfde oplichter bij verschillende slachtoffers.'],
   reputation: ['Reputatie', 'De blockchain-verkenner waarschuwt dat dit adres of deze munt niet te vertrouwen is.']
 };
 const HELP_ORDER = ['address', 'tx', 'hop', 'exchange', 'mixer', 'bridge', 'contract', 'sanction', 'frozen', 'startwallet', 'suspect', 'victim2', 'passthrough', 'fanin', 'fanout', 'peel', 'lookalike', 'dust', 'service'];
@@ -2119,7 +2341,9 @@ function plainStory(n) {
   else if (has('mixer')) out.push('Dit is een mixer: hier wordt geld onherkenbaar gemaakt. Verder volgen lukt meestal niet.');
   else if (has('bridge')) out.push('Via dit adres is geld naar een andere blockchain gegaan. Het spoor gaat daar verder.');
   else if (has('contract')) out.push('Dit is een programma (smart contract), geen persoon.');
-  const bad = n.flags.filter(f => BAD_CODES.includes(f.code));
+  const exch = has('exchange');
+  const bad = n.flags.filter(f => BAD_CODES.includes(f.code) && !(exch && f.code === 'frozen'));
+  if (exch && has('frozen')) out.push('Tether heeft USDT op dit exchange-adres geblokkeerd. Bij een groot exchange-adres zegt dat iets over de exchange, niet per se over jouw zaak.');
   if (bad.length) out.push(`Let op: dit adres staat op een waarschuwingslijst (${bad.map(f => HELP[f.code]?.[0] || f.code).join(', ')}).`);
   if (n.flags.some(f => f.code === 'lookalike' && f.level === 'high')) out.push('Dit adres lijkt sterk op een ander adres: waarschijnlijk een valstrik (address poisoning).');
   const d = n.data;
@@ -2311,10 +2535,11 @@ function copyPlain(text) {
 function extractFromText(text) {
   text = String(text || '');
   const cands = [];
-  const re = /0x[a-fA-F0-9]{64}|0x[a-fA-F0-9]{40}|\bT[1-9A-HJ-NP-Za-km-z]{33}\b|\bbc1[a-zA-HJ-NP-Z0-9]{25,87}\b|\b[13][1-9A-HJ-NP-Za-km-z]{25,34}\b|\b[a-fA-F0-9]{64}\b/g;
+  const re = /0x[a-fA-F0-9]{64}|0x[a-fA-F0-9]{40}|\bT[1-9A-HJ-NP-Za-km-z]{33}\b|\b(?:bc1|ltc1)[a-zA-HJ-NP-Z0-9]{25,87}\b|\b[13LM][1-9A-HJ-NP-Za-km-z]{25,34}\b|\b[a-fA-F0-9]{64}\b|\b[1-9A-HJ-NP-Za-km-z]{86,88}\b|\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
   let m;
   while ((m = re.exec(text))) cands.push(m[0]);
-  for (const c of cands) { const a = /^bc1/i.test(c) ? c.toLowerCase() : c; if (detectChain(a)) return { kind: 'addr', value: a, chain: detectChain(a) }; }
+  for (const c of cands) { const a = /^(bc1|ltc1)/i.test(c) ? c.toLowerCase() : c; if (detectChain(a)) return { kind: 'addr', value: a, chain: detectChain(a) }; }
+  for (const c of cands) if (/^[1-9A-HJ-NP-Za-km-z]{86,88}$/.test(c)) return { kind: 'tx', value: c, chain: 'sol' };
   for (const c of cands) if (/^(0x)?[a-fA-F0-9]{64}$/.test(c)) return { kind: 'tx', value: c.toLowerCase(), chain: c.startsWith('0x') ? 'eth' : null };
   return null;
 }
@@ -2394,7 +2619,485 @@ function setupSimple() {
   });
 }
 
+// ---------- voorbeeldzaak: verzonnen gegevens, de echte analyse draait erop ----------
+const DEMO = (() => {
+  const idx = { V: 1, A: 2, W1: 3, W2: 4, B: 5, C: 6, X: 7, M: 8, E: 9, D: 10 };
+  const ad = k => '0xdec0de' + '0'.repeat(32) + idx[k].toString(16).padStart(2, '0');
+  const base = Date.UTC(2026, 9, 1, 9, 0) / 1000;
+  const at = (day, min = 0) => base + day * 86400 + min * 60;
+  let n = 0;
+  const T = [];
+  const add = (f, t, v, asset, time) => T.push({ from: ad(f), to: ad(t), value: v, asset, time, txid: '0xdec0de' + (++n).toString(16).padStart(58, '0'), usd: asset === 'ETH' ? v * 3000 : v });
+  add('E', 'V', 2, 'ETH', at(0)); add('E', 'V', 5000, 'USDT', at(0, 5));
+  add('V', 'A', 1.5, 'ETH', at(2)); add('A', 'B', 1.5, 'ETH', at(2, 30));
+  add('W1', 'A', 3000, 'USDT', at(3)); add('A', 'B', 3000, 'USDT', at(3, 40));
+  add('V', 'A', 4000, 'USDT', at(4)); add('A', 'B', 4000, 'USDT', at(4, 20));
+  add('W2', 'A', 1.2, 'ETH', at(5)); add('A', 'B', 1.2, 'ETH', at(5, 15));
+  add('V', 'A', 0.5, 'ETH', at(7)); add('A', 'B', 0.5, 'ETH', at(7, 30));
+  add('B', 'C', 2.5, 'ETH', at(8)); add('B', 'C', 7000, 'USDT', at(8, 10));
+  add('C', 'X', 2.5, 'ETH', at(8, 70)); add('C', 'X', 7000, 'USDT', at(8, 75));
+  add('B', 'D', 0.7, 'ETH', at(9)); add('D', 'M', 0.7, 'ETH', at(9, 45));
+  const meta = {
+    [ad('X')]: { tags: ['Voorbeeld-Exchange: Hot Wallet (fictief)'] },
+    [ad('E')]: { tags: ['Voorbeeld-Exchange: Inkoop (fictief)'] },
+    [ad('M')]: { tags: ['Voorbeeld-Mixer (fictief)'] }
+  };
+  const data = {};
+  for (const k of Object.keys(idx)) {
+    const a = ad(k);
+    data[a] = { transfers: T.filter(t => t.from === a || t.to === a), meta, txCount: ['X', 'E', 'M'].includes(k) ? 250000 : null, balance: k === 'V' ? '0,5 ETH' : '0 ETH', cursor: null };
+  }
+  return { victim: ad('V'), scammer: ad('A'), data };
+})();
+let demoMode = false;
+const demoData = addr => structuredClone(DEMO.data[addr.toLowerCase()] || { transfers: [], meta: {}, txCount: 0, balance: null, cursor: null });
+
+function startDemo() {
+  setTab('form');
+  $('#addr').value = DEMO.victim;
+  $('#roleVictim').checked = true;
+  $('#pattern').value = 'pig';
+  applyPatternDefaults();
+  $('#depth').value = 4;
+  updateChainHint();
+  $('#traceForm').requestSubmit();
+}
+function renderDemoBanner() { $('#demoBanner').hidden = !(demoMode && nodes.size); }
+
+// ---------- voorlezen ----------
+const canSpeak = () => !!(window.AndroidBridge?.speak || 'speechSynthesis' in window);
+let speaking = false;
+function speak(text) {
+  text = String(text || '').replace(/\s+/g, ' ').replace(/0x[0-9a-f]{6,}…?[0-9a-f]*/gi, 'een adres').trim();
+  if (!text) return;
+  speaking = true;
+  if (window.AndroidBridge?.speak) { window.AndroidBridge.speak(text); return; }
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'nl-NL';
+  const v = speechSynthesis.getVoices().find(x => x.lang?.toLowerCase().startsWith('nl'));
+  if (v) u.voice = v;
+  u.onend = () => { speaking = false; };
+  speechSynthesis.speak(u);
+}
+function stopSpeak() {
+  speaking = false;
+  if (window.AndroidBridge?.stopSpeaking) window.AndroidBridge.stopSpeaking();
+  else if ('speechSynthesis' in window) speechSynthesis.cancel();
+}
+const speakBtn = target => canSpeak() ? `<button type="button" class="speak" data-speak="${target}" aria-label="Lees voor">🔊 Lees voor</button>` : '';
+function speakTarget(t, btn) {
+  if (speaking) { stopSpeak(); return; }
+  const box = t === 'self' ? btn.closest('[data-speak-box]') : $(t);
+  if (!box) return;
+  const clone = box.cloneNode(true);
+  clone.querySelectorAll('button.speak, .tag i, small').forEach(e => e.remove());
+  speak(clone.innerText);
+}
+
+// ---------- Mijn zaken: onderzoeken automatisch bewaren, per zaak ----------
+const idb = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('chaintrace', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const run = (mode, fn) => open().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('kv', mode);
+    const req = fn(tx.objectStore('kv'));
+    tx.oncomplete = () => res(req?.result);
+    tx.onerror = () => rej(tx.error);
+  }));
+  return {
+    get: k => run('readonly', s => s.get(k)),
+    set: (k, v) => run('readwrite', s => s.put(v, k)),
+    del: k => run('readwrite', s => s.delete(k))
+  };
+})();
+const cases = {
+  list: () => store.get('chaintrace.cases', []),
+  save: l => store.set('chaintrace.cases', l),
+  currentId: () => store.get('chaintrace.case', null),
+  setCurrent: id => store.set('chaintrace.case', id)
+};
+const caseById = id => cases.list().find(c => c.id === id);
+function newCase(name) {
+  const c = { id: 'c' + Date.now().toString(36), name: name || `Zaak van ${new Date().toLocaleDateString('nl-NL', { day: 'numeric', month: 'long', year: 'numeric' })}`, created: Date.now(), items: [] };
+  cases.save([c, ...cases.list()]);
+  cases.setCurrent(c.id);
+  renderCaseBar();
+  return c;
+}
+function buildDossier() {
+  const seed = nodes.get(current?.seedKey);
+  return {
+    tool: 'ChainTrace', version: 1, exported: new Date().toISOString(),
+    case: current && { chain: current.chain, role: current.role, pattern: window.PATTERNS[current.pattern].name, patternKey: current.pattern, seed: seed?.addr, started: current.started },
+    nodes: [...nodes.values()].map(n => ({ key: n.key, chain: n.chain, address: n.addr, label: labelOf(n), role: n.role, classification: nodeClass(n), hop: n.depth, flags: n.flags, seed: !!n.seed, hint: n.hint, parent: n.parent, upstream: !!n.upstream })),
+    edges: [...edges.values()].map(e => ({ ...e, first: e.first === Infinity ? null : e.first })),
+    origins: { rootKey: origins.rootKey, starts: [...origins.starts.values()], cashIn: origins.cashIn },
+    notes,
+    customLabels
+  };
+}
+let saveTimer = null;
+function autosave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    if (!current || demoMode || current.merged || !nodes.size) return;
+    const seed = nodes.get(current.seedKey);
+    if (!seed) return;
+    let c = caseById(cases.currentId()) || newCase();
+    const item = { seedKey: current.seedKey, chain: current.chain, addr: seed.addr, role: current.role, pattern: window.PATTERNS[current.pattern].name,
+      title: labelOf(seed) || short(seed.addr), saved: Date.now(), size: nodes.size };
+    try { await idb.set(`dossier:${c.id}:${current.seedKey}`, buildDossier()); } catch { return; }
+    const list = cases.list();
+    c = list.find(x => x.id === c.id);
+    c.items = [item, ...c.items.filter(i => i.seedKey !== item.seedKey)];
+    c.updated = Date.now();
+    cases.save(list);
+    renderCaseBar();
+  }, 1500);
+}
+function renderCaseBar() {
+  const c = caseById(cases.currentId());
+  $('#caseName').textContent = c ? c.name : 'nog geen zaak';
+  $('#caseCount').textContent = c ? `${c.items.length} onderzoek${c.items.length === 1 ? '' : 'en'}` : '';
+}
+let caseSel = null;
+function renderCases() {
+  const list = cases.list();
+  if (!caseSel || !list.some(c => c.id === caseSel)) caseSel = cases.currentId() || list[0]?.id || null;
+  const c = list.find(x => x.id === caseSel);
+  $('#caseList').innerHTML = list.map(x => `<button type="button" class="case-item ${x.id === caseSel ? 'active' : ''}" data-case="${x.id}">
+      <b>${esc(x.name)}</b><small>${x.items.length} onderzoek${x.items.length === 1 ? '' : 'en'} · ${new Date(x.updated || x.created).toLocaleDateString('nl-NL')}${x.id === cases.currentId() ? ' · <em>huidige zaak</em>' : ''}</small></button>`).join('')
+    || '<p class="muted">Nog geen zaken. Een onderzoek wordt automatisch bewaard zodra het klaar is.</p>';
+  $('#caseDetail').hidden = !c;
+  if (!c) return;
+  $('#caseTitle').textContent = c.name;
+  $('#caseItems').innerHTML = c.items.map(i => `<div class="xrow"><div class="xrow-top"><i class="dot ${i.role === 'perp' ? 'perp' : 'victim'}"></i><b>${esc(i.title)}</b><span class="muted small">${esc(CHAIN_NAME[i.chain] || i.chain)}</span></div>
+      <div class="xrow-sub muted">${i.role === 'perp' ? 'Dader' : 'Slachtoffer'} · ${esc(i.pattern)} · ${i.size} adressen · bewaard ${new Date(i.saved).toLocaleString('nl-NL', { dateStyle: 'short', timeStyle: 'short' })}</div>
+      <div class="lbtns"><button type="button" class="ghost" data-open="${esc(i.seedKey)}">Openen</button><button type="button" class="ghost" data-del="${esc(i.seedKey)}">Verwijderen</button></div></div>`).join('')
+    || '<p class="muted">Deze zaak heeft nog geen onderzoeken. Start een onderzoek: het wordt hier automatisch bewaard.</p>';
+  $('#caseMerge').disabled = c.items.length < 2;
+}
+async function openCaseItem(caseId, seedKey, merge = false) {
+  const d = await idb.get(`dossier:${caseId}:${seedKey}`);
+  if (!d) { setStatus('Dit onderzoek kon niet worden geladen.', true); return; }
+  importJson(d, { merge });
+}
+async function mergeCase(c) {
+  const ds = [];
+  for (const i of c.items) { const d = await idb.get(`dossier:${c.id}:${i.seedKey}`); if (d) ds.push(d); }
+  if (!ds.length) return;
+  importJson(ds[0]);
+  for (const d of ds.slice(1)) importJson(d, { merge: true });
+  // Adressen die in meerdere onderzoeken voorkomen: belangrijke verbanden.
+  const seen = new Map();
+  for (const d of ds) for (const x of new Set(d.nodes.map(n => n.key))) seen.set(x, (seen.get(x) || 0) + 1);
+  let overlap = 0;
+  for (const [k, cnt] of seen) if (cnt > 1 && nodes.has(k)) { addFlag(nodes.get(k), 'overlap', 'high', `Komt voor in ${cnt} onderzoeken van deze zaak`); overlap++; }
+  current.merged = true;
+  render(true); renderSummary();
+  setStatus(`${ds.length} onderzoeken samen in één web: ${nodes.size} adressen, ${overlap} adres(sen) komen in meer dan één onderzoek voor.`);
+  if (isMobile()) setTab('graph');
+}
+
+// ---------- gevolgde adressen: melding bij nieuwe beweging ----------
+const watch = {
+  get() {
+    if (window.AndroidBridge?.getWatchlist) { try { return JSON.parse(window.AndroidBridge.getWatchlist() || '[]'); } catch { return []; } }
+    return store.get('chaintrace.watch', []);
+  },
+  set(l) {
+    if (window.AndroidBridge?.saveWatchlist) window.AndroidBridge.saveWatchlist(JSON.stringify(l));
+    else store.set('chaintrace.watch', l);
+    renderWatchBanner();
+  }
+};
+const watchKey = (chain, addr) => keyOf(chain, addr);
+const isWatched = n => watch.get().some(w => watchKey(w.chain, w.addr) === n.key);
+
+// Een korte "vingerafdruk" van de activiteit: verandert als er een nieuwe transactie is.
+async function watchSig(chain, addr) {
+  const g = (u, body) => getData(u + (body ? '' : (u.includes('?') ? '&' : '?') + '_t=' + Date.now()), false, 2, body);
+  if (isUtxo(chain)) { const r = await g(`${API[chain]}/address/${addr}`); return String((r?.chain_stats?.tx_count || 0) + (r?.mempool_stats?.tx_count || 0)); }
+  if (isBlockscout(chain)) { const c = await g(`${API[chain]}/addresses/${addr}/counters`); return `${c?.transactions_count || 0}/${c?.token_transfers_count || 0}`; }
+  if (chain === 'avax') {
+    const [a, b] = await Promise.all([g(`${API.avax}?module=account&action=txlist&address=${addr}&page=1&offset=1&sort=desc`), g(`${API.avax}?module=account&action=tokentx&address=${addr}&page=1&offset=1&sort=desc`)]);
+    return `${rsArr(a)[0]?.hash || ''}/${rsArr(b)[0]?.hash || ''}`;
+  }
+  if (chain === 'zksync') { const r = await g(`${API.zksync}/address/${addr}/transfers?limit=1`); return String(r?.meta?.totalItems || 0); }
+  if (chain === 'sol') { const r = await g(API.sol, { ...solRpc('getSignaturesForAddress', [addr, { limit: 1 }]), id: Date.now() }); return r?.result?.[0]?.signature || ''; }
+  const r = await g(`${API.tron}/v1/accounts/${addr}/transactions/trc20?limit=1`);
+  return r?.data?.[0]?.transaction_id || '';
+}
+async function toggleWatch(n) {
+  const l = watch.get();
+  const i = l.findIndex(w => watchKey(w.chain, w.addr) === n.key);
+  if (i >= 0) { l.splice(i, 1); watch.set(l); setStatus('Dit adres wordt niet meer gevolgd.'); return; }
+  let sig = '';
+  try { sig = await watchSig(n.chain, n.addr); } catch { /* volgende controle legt de basis vast */ }
+  l.push({ chain: n.chain, addr: n.addr, label: labelOf(n) || '', caseName: caseById(cases.currentId())?.name || '', added: Date.now(), sig, lastCheck: Date.now(), changed: false });
+  watch.set(l);
+  try { window.AndroidBridge?.watchEnabled?.(); } catch { /* geen melding-rechten */ }
+  setStatus('Dit adres wordt nu gevolgd. Je krijgt een melding als er weer geld beweegt.');
+}
+let watchBusy = false;
+async function checkWatches(manual = false) {
+  if (watchBusy) return;
+  const l = watch.get();
+  if (!l.length) { if (manual) setStatus('Je volgt nog geen adressen.'); return; }
+  watchBusy = true;
+  let changed = 0;
+  for (const w of l) {
+    try {
+      const sig = await watchSig(w.chain, w.addr);
+      if (w.sig && sig && sig !== w.sig) { w.changed = true; w.lastChange = Date.now(); changed++; }
+      if (sig) w.sig = sig;
+      w.lastCheck = Date.now();
+    } catch { /* volgende keer opnieuw */ }
+  }
+  // De lijst kan intussen (door de achtergrondtaak) gewijzigd zijn: alleen onze velden terugschrijven.
+  const fresh = watch.get();
+  for (const f of fresh) { const m = l.find(w => w.chain === f.chain && w.addr === f.addr); if (m) Object.assign(f, { sig: m.sig, lastCheck: m.lastCheck, changed: f.changed || m.changed, lastChange: m.lastChange || f.lastChange }); }
+  watch.set(fresh);
+  watchBusy = false;
+  if (manual) setStatus(changed ? `Nieuwe beweging op ${changed} adres(sen)!` : 'Gecontroleerd: geen nieuwe beweging.');
+  if ($('#watchDlg').open) renderWatches();
+}
+function renderWatchBanner() {
+  const n = watch.get().filter(w => w.changed).length;
+  $('#watchBanner').hidden = !n;
+  $('#watchBannerText').textContent = `Nieuwe beweging op ${n} gevolgd${n === 1 ? ' adres' : 'e adressen'}`;
+}
+function renderWatches() {
+  const l = watch.get();
+  $('#watchList').innerHTML = l.map((w, i) => `<div class="xrow ${w.changed ? 'wnew' : ''}">
+      <div class="xrow-top"><b>${esc(w.label || short(w.addr))}</b><span class="muted small">${esc(CHAIN_NAME[w.chain] || w.chain)}</span>${w.changed ? '<span class="tag high">NIEUW</span>' : ''}</div>
+      <div class="xrow-sub muted">${w.changed ? `Nieuwe beweging gezien op ${new Date(w.lastChange).toLocaleString('nl-NL', { dateStyle: 'short', timeStyle: 'short' })}` : 'Geen nieuwe beweging'} · laatst gecontroleerd ${w.lastCheck ? new Date(w.lastCheck).toLocaleString('nl-NL', { dateStyle: 'short', timeStyle: 'short' }) : 'nog niet'}${w.caseName ? ' · ' + esc(w.caseName) : ''}</div>
+      <div class="lbtns"><button type="button" class="ghost" data-wopen="${i}">Bekijk</button><button type="button" class="ghost" data-wdel="${i}">Stop met volgen</button></div></div>`).join('')
+    || '<p class="muted">Je volgt nog geen adressen. Open een adres en tik op "🔔 Volg dit adres".</p>';
+}
+function openWatch(i) {
+  const l = watch.get();
+  const w = l[i];
+  if (!w) return;
+  w.changed = false;
+  watch.set(l);
+  // Verse gegevens ophalen: oude antwoorden voor dit adres vergeten.
+  for (const k of [...cache.keys()]) if (k.includes(w.addr)) cache.delete(k);
+  const n = nodes.get(keyOf(w.chain, w.addr)) || ghosts.get(keyOf(w.chain, w.addr));
+  if (n) { n.data = null; n.loadTried = false; }
+  $('#watchDlg').close();
+  openAddr(w.chain, w.addr);
+}
+
+// ---------- rondleiding (gebruikt de voorbeeldzaak) ----------
+const tour = { on: false };
+class TourStop extends Error {}
+const tourWait = ms => new Promise((res, rej) => {
+  const t0 = Date.now();
+  const tick = () => { if (!tour.on) return rej(new TourStop()); if (Date.now() - t0 >= ms) return res(); setTimeout(tick, 100); };
+  tick();
+});
+function tourTop() { for (const id of ['#tourRing', '#tourCap']) { const e = $(id); try { if (e.matches(':popover-open')) e.hidePopover(); e.showPopover(); } catch { /* geen popover-API */ } } }
+function tourCaption(text) {
+  $('#tourText').textContent = text;
+  $('#tourCap').hidden = false;
+  tourTop();
+  if (tour.voice) speak(text);
+}
+function tourPoint(el) {
+  const ring = $('#tourRing');
+  if (!el) { ring.hidden = true; return; }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  setTimeout(() => {
+    const r = el.getBoundingClientRect();
+    Object.assign(ring.style, { left: (r.left - 6) + 'px', top: (r.top - 6) + 'px', width: (r.width + 12) + 'px', height: (r.height + 12) + 'px' });
+    ring.hidden = false;
+    tourTop();
+  }, 350);
+}
+const q = s => typeof s === 'string' ? document.querySelector(s) : s;
+async function tStep(text, ms, sel) {
+  const el = sel ? q(sel) : null;
+  if (sel && !el) console.warn('rondleiding: niet gevonden', sel);
+  tourCaption(text); tourPoint(el); await tourWait(ms);
+}
+async function tClick(sel, after = 1500) {
+  const el = q(sel);
+  if (!el) { console.warn('rondleiding: niet gevonden', sel); return; }
+  tourPoint(el);
+  await tourWait(900);
+  $('#tourRing').classList.add('press');
+  el.click();
+  await tourWait(250);
+  $('#tourRing').classList.remove('press');
+  await tourWait(after);
+}
+async function tType(sel, text) {
+  const el = q(sel);
+  tourPoint(el);
+  el.value = '';
+  for (let i = 0; i < text.length; i += 3) { el.value = text.slice(0, i + 3); await tourWait(40); }
+  updateChainHint();
+}
+async function runTour() {
+  if (tour.on) return;
+  tour.on = true;
+  tour.voice = !!$('#tourVoice')?.checked;
+  hideDetail();
+  demoMode = false;
+  resetGraph();
+  render(true);
+  setTab('form');
+  try {
+    await tStep('Welkom bij ChainTrace! In deze rondleiding volgen we samen het geld in een verzonnen oplichtingszaak.', 5000);
+    await tStep('Stap 1: plak het walletadres van het slachtoffer. Je mag ook een heel bericht plakken, of met de QR-knop een QR-code uit een foto lezen.', 3500, '#addr');
+    await tType('#addr', DEMO.victim);
+    await tourWait(1200);
+    await tStep('Stap 2: kies van wie het adres is. Hier: van het slachtoffer.', 3500, '.seg');
+    $('#pattern').value = 'pig'; applyPatternDefaults(); $('#depth').value = 4;
+    await tStep('Stap 3: kies wat er gebeurde. Hier: een nep-beleggingsplatform. Dit mag je ook overslaan.', 4000, '#pattern');
+    await tStep('Tik op "Start onderzoek". De app volgt nu automatisch waar het geld heen ging.', 2500, '#btnTrace');
+    await tClick('#btnTrace', 600);
+    for (let i = 0; i < 60 && $('#btnTrace').disabled; i++) await tourWait(250);
+    setTab('graph');
+    cy?.fit(undefined, 40);
+    await tStep('Het web toont alle adressen en geldstromen. Rood en oranje is verdacht, groen is een exchange, paars een mixer.', 6500, '#cy');
+    setTab('form');
+    await tStep('De samenvatting vertelt in gewone taal wat er gevonden is.', 5000, '#summary');
+    await tStep('"Het geld stap voor stap" laat de route zien: van het slachtoffer, via doorsluisadressen, naar een exchange.', 6500, '#routeList .route-card');
+    await tStep('Bij een exchange kan de politie opvragen van wie het account is. Met één tik maak je een brief aan de exchange.', 4500, '#routeList [data-letter]');
+    await tClick('#routeList [data-letter]', 800);
+    await tStep('De brief is al ingevuld met adressen, transacties en tijden. Vul je naam en aangiftenummer in en kopieer of deel de brief.', 6500, '#lText');
+    $('#letterDlg').close();
+    await tStep('Tik op een stap om dat adres te bekijken.', 2500, '#routeList .route-steps li');
+    await tClick('#routeList .route-steps li', 1500);
+    await tStep('Bovenaan staat in gewone taal wat we over dit adres weten.', 5500, '#detailBody .story');
+    const help = $('#detailBody .tag.help[data-help=passthrough]') || $('#detailBody .tag.help');
+    await tStep('Tik op een label met een vraagteken voor uitleg.', 2500, help);
+    await tClick(help, 1000);
+    await tourWait(3000);
+    $('#helpDlg').close();
+    await tStep('"Waar kwam het vandaan?" zoekt wie er nog meer geld naar dit adres stuurde: mogelijk andere slachtoffers.', 4000, '#detailBody [data-act=origins]');
+    await tClick('#detailBody [data-act=origins]', 1500);
+    await tStep('Tik op een transactie om te zien wie betaalde en wie ontving. Zo klik je door, net als in een blockchain-verkenner.', 4000, '#detailBody [data-tx]');
+    await tClick('#detailBody [data-tx]', 1200);
+    await tourWait(3000);
+    await tStep('Met "Terug" ga je een stap terug.', 2500, '#detailBody [data-nav=back]');
+    await tClick('#detailBody [data-nav=back]', 1000);
+    await tStep('Met "Volg dit adres" krijg je een melding als er weer geld beweegt. Met de luidspreker laat je de uitleg voorlezen.', 6000, '#detailBody [data-act=watch]');
+    closeExplorer();
+    await tourWait(600);
+    setTab('form');
+    await tStep('Echte onderzoeken worden automatisch bewaard onder "Mijn zaken". Daar kun je ook meerdere onderzoeken samen in één web zetten.', 6000, '#caseBar');
+    await tStep('Maak tot slot een PDF-rapport met alle adressen en transacties voor je aangifte.', 5000, '#btnPdf');
+    await tStep('Klaar! Je kunt deze rondleiding altijd opnieuw starten via "Meer". Succes met je onderzoek.', 5000);
+  } catch (e) {
+    if (!(e instanceof TourStop)) console.error(e);
+  } finally {
+    stopTour();
+  }
+}
+function stopTour() {
+  tour.on = false;
+  for (const id of ['#tourRing', '#tourCap']) { const e = $(id); e.hidden = true; try { e.hidePopover(); } catch { /* */ } }
+  stopSpeak();
+}
+
+function setupFeatures() {
+  // voorbeeldzaak en rondleiding
+  $('#btnDemo').addEventListener('click', startDemo);
+  $('#btnTourEmpty').addEventListener('click', runTour);
+  $('#btnTour').addEventListener('click', runTour);
+  $('#btnTourStop').addEventListener('click', stopTour);
+  $('#btnDemoStop').addEventListener('click', () => { demoMode = false; resetGraph(); render(true); $('#addr').value = ''; updateChainHint(); setStatus(''); renderDemoBanner(); });
+  // keuze van de EVM-keten
+  $('#chainPick').addEventListener('click', ev => {
+    const b = ev.target.closest('[data-pick]');
+    if (!b) return;
+    $('#chain').value = b.dataset.pick;
+    const e = new Event('submit', { cancelable: true });
+    e.chainPicked = true;
+    $('#traceForm').dispatchEvent(e);
+    $('#chain').value = 'auto';
+    $('#chainPick').hidden = true;
+  });
+  // voorlezen
+  document.addEventListener('click', ev => {
+    const b = ev.target.closest('[data-speak]');
+    if (b) { ev.preventDefault(); ev.stopPropagation(); speakTarget(b.dataset.speak, b); }
+  }, true);
+  for (const id of ['#speakSummary', '#speakRoute', '#speakHelp']) $(id).hidden = !canSpeak();
+  window.ChainTraceSpeechDone = () => { speaking = false; };
+  // zaken
+  renderCaseBar();
+  const dlg = $('#caseDlg');
+  const openCases = () => { renderCases(); dlg.showModal(); };
+  $('#btnCases').addEventListener('click', openCases);
+  $('#btnCases2').addEventListener('click', openCases);
+  $('#btnCaseClose').addEventListener('click', () => dlg.close());
+  $('#caseList').addEventListener('click', ev => { const b = ev.target.closest('[data-case]'); if (b) { caseSel = b.dataset.case; renderCases(); } });
+  $('#caseItems').addEventListener('click', async ev => {
+    const o = ev.target.closest('[data-open]'), d = ev.target.closest('[data-del]');
+    if (o) { cases.setCurrent(caseSel); renderCaseBar(); dlg.close(); await openCaseItem(caseSel, o.dataset.open); if (isMobile()) setTab('graph'); }
+    if (d && confirm('Dit onderzoek uit de zaak verwijderen?')) {
+      const l = cases.list(); const c = l.find(x => x.id === caseSel);
+      c.items = c.items.filter(i => i.seedKey !== d.dataset.del);
+      cases.save(l); idb.del(`dossier:${caseSel}:${d.dataset.del}`).catch(() => {});
+      renderCases(); renderCaseBar();
+    }
+  });
+  $('#caseNew').addEventListener('click', () => {
+    const name = prompt('Naam van de nieuwe zaak (bijv. aangiftenummer of naam slachtoffer):', '');
+    if (name === null) return;
+    caseSel = newCase(name.trim() || undefined).id;
+    renderCases();
+    setStatus('Nieuwe onderzoeken worden nu in deze zaak bewaard.');
+  });
+  $('#caseUse').addEventListener('click', () => { cases.setCurrent(caseSel); renderCaseBar(); renderCases(); setStatus('Nieuwe onderzoeken worden nu in deze zaak bewaard.'); });
+  $('#caseRename').addEventListener('click', () => {
+    const l = cases.list(); const c = l.find(x => x.id === caseSel); if (!c) return;
+    const name = prompt('Nieuwe naam:', c.name);
+    if (!name?.trim()) return;
+    c.name = name.trim(); cases.save(l); renderCases(); renderCaseBar();
+  });
+  $('#caseMerge').addEventListener('click', async () => { const c = caseById(caseSel); if (!c) return; dlg.close(); await mergeCase(c); });
+  $('#caseDelete').addEventListener('click', () => {
+    const c = caseById(caseSel); if (!c) return;
+    if (!confirm(`Zaak "${c.name}" met ${c.items.length} onderzoek(en) verwijderen? Dit kan niet ongedaan worden gemaakt.`)) return;
+    for (const i of c.items) idb.del(`dossier:${c.id}:${i.seedKey}`).catch(() => {});
+    cases.save(cases.list().filter(x => x.id !== c.id));
+    if (cases.currentId() === c.id) cases.setCurrent(null);
+    caseSel = null; renderCases(); renderCaseBar();
+  });
+  // gevolgde adressen
+  const wd = $('#watchDlg');
+  const openWatches = () => { renderWatches(); wd.showModal(); };
+  $('#btnWatch').addEventListener('click', openWatches);
+  $('#watchBannerBtn').addEventListener('click', openWatches);
+  $('#btnWatchClose').addEventListener('click', () => wd.close());
+  $('#btnWatchCheck').addEventListener('click', () => checkWatches(true));
+  $('#watchList').addEventListener('click', ev => {
+    const o = ev.target.closest('[data-wopen]'), d = ev.target.closest('[data-wdel]');
+    if (o) openWatch(+o.dataset.wopen);
+    if (d) { const l = watch.get(); l.splice(+d.dataset.wdel, 1); watch.set(l); renderWatches(); }
+  });
+  renderWatchBanner();
+  setTimeout(() => checkWatches(false), 4000);
+  setInterval(() => checkWatches(false), 30 * 60 * 1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) renderWatchBanner(); });
+  // vanuit een melding geopend?
+  window.ChainTraceOpenWatch = a => { const i = watch.get().findIndex(x => x.addr === a); if (i >= 0) openWatch(i); };
+  const w = new URLSearchParams(location.search).get('watch');
+  if (w) setTimeout(() => { const i = watch.get().findIndex(x => x.addr === w); if (i >= 0) openWatch(i); }, 500);
+}
+
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

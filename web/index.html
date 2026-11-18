@@ -28,6 +28,9 @@
         <button id="btnExportJson" type="button" disabled>Dossier opslaan</button>
         <label class="filebtn">Dossier openen<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
         <button id="btnDb" type="button" hidden>OSINT-database</button>
+        <button id="btnTour" type="button">▶ Rondleiding</button>
+        <button id="btnCases" type="button">📁 Mijn zaken</button>
+        <button id="btnWatch" type="button">🔔 Gevolgde adressen</button>
         <button id="btnBig" type="button">Grote letters</button>
         <button id="btnGlossary" type="button">Woordenlijst (uitleg)</button>
       </div>
@@ -37,6 +40,9 @@
 
 <main class="layout">
   <section class="panel form-panel">
+    <div id="watchBanner" class="banner watchb" hidden><span>🔔 <b id="watchBannerText"></b></span><button type="button" id="watchBannerBtn" class="ghost">Bekijk</button></div>
+    <div id="demoBanner" class="banner demob" hidden><span>📘 Dit is een <b>voorbeeldzaak met verzonnen gegevens</b>.</span><button type="button" id="btnDemoStop" class="ghost">Stop voorbeeld</button></div>
+    <div id="caseBar" class="casebar"><span>📁 Zaak: <b id="caseName">nog geen zaak</b> <small id="caseCount" class="muted"></small></span><button type="button" id="btnCases2" class="ghost">Mijn zaken</button></div>
     <form id="traceForm" autocomplete="off">
       <label class="field">
         <span>1. Welk walletadres wil je onderzoeken? <button type="button" class="qmark" data-help="address" aria-label="Uitleg walletadres">?</button></span>
@@ -47,7 +53,7 @@
           <input type="file" id="qrFile" accept="image/*" hidden>
         </div>
         <datalist id="recentAddrs"></datalist>
-        <small id="chainHint" class="hint">Bitcoin, Ethereum en Tron worden automatisch herkend. Je mag ook een heel bericht plakken, of een QR-code uit een foto/screenshot lezen.</small>
+        <small id="chainHint" class="hint">Bitcoin, Ethereum, Tron, Solana, Litecoin, Avalanche, Optimism en zkSync worden automatisch herkend. Je mag ook een heel bericht plakken, of een QR-code uit een foto/screenshot lezen.</small>
       </label>
 
       <fieldset class="field">
@@ -76,6 +82,10 @@
             <option value="eth">Ethereum</option>
             <option value="op">Optimism</option>
             <option value="tron">Tron</option>
+            <option value="sol">Solana</option>
+            <option value="avax">Avalanche</option>
+            <option value="zksync">zkSync Era</option>
+            <option value="ltc">Litecoin</option>
           </select>
         </label>
         <label class="row"><span>Aantal stappen volgen</span><input id="depth" type="number" min="1" max="4" value="2"></label>
@@ -86,16 +96,17 @@
       <button type="submit" id="btnTrace" class="primary">Start onderzoek</button>
       <button type="button" id="btnStop" class="ghost" hidden>Stop</button>
       <div id="status" class="status" aria-live="polite"></div>
+      <div id="chainPick" class="chainpick" hidden></div>
     </form>
 
     <div class="summary" id="summary" hidden>
-      <h2>Samenvatting</h2>
+      <h2>Samenvatting <button type="button" id="speakSummary" class="speak" data-speak="#summaryList">🔊 Lees voor</button></h2>
       <ul id="summaryList"></ul>
       <button id="btnPdf2" class="primary" type="button">Maak PDF-rapport</button>
     </div>
 
     <details class="sec route" id="routeBox" hidden open>
-      <summary>Het geld stap voor stap</summary>
+      <summary>Het geld stap voor stap <button type="button" id="speakRoute" class="speak" data-speak="#routeList">🔊</button></summary>
       <div id="routeList"></div>
     </details>
 
@@ -155,6 +166,11 @@
           <li><b>Maak een PDF-rapport</b> — met alle adressen en transacties, voor je aangifte.</li>
         </ol>
         <p>Geen account nodig. Je gegevens blijven op dit apparaat.</p>
+        <div class="empty-actions">
+          <button type="button" id="btnTourEmpty" class="primary">▶ Rondleiding (2 minuten)</button>
+          <button type="button" id="btnDemo" class="ghost">Bekijk een voorbeeldzaak</button>
+          <label class="small"><input type="checkbox" id="tourVoice"> rondleiding laten voorlezen</label>
+        </div>
       </div>
     </div>
   </section>
@@ -201,7 +217,7 @@
 </dialog>
 
 <dialog id="helpDlg" class="dlg dlg-small">
-  <div class="dlg-head"><span></span><button class="close" id="btnHelpClose" type="button" aria-label="Sluiten">×</button></div>
+  <div class="dlg-head"><button type="button" id="speakHelp" class="speak" data-speak="#helpBody">🔊 Lees voor</button><button class="close" id="btnHelpClose" type="button" aria-label="Sluiten">×</button></div>
   <div id="helpBody" class="helpbody"></div>
 </dialog>
 
@@ -224,6 +240,34 @@
     <a id="lSearch" class="ghost" target="_blank" rel="noopener noreferrer">Zoek het contactadres</a>
   </div>
 </dialog>
+
+<dialog id="caseDlg" class="dlg">
+  <div class="dlg-head"><h2>📁 Mijn zaken</h2><button class="close" id="btnCaseClose" type="button" aria-label="Sluiten">×</button></div>
+  <p class="small muted">Elk onderzoek wordt automatisch bewaard in de huidige zaak, alleen op dit apparaat. Zet meerdere onderzoeken samen in één web om verbanden te zien, zoals dezelfde oplichter bij verschillende slachtoffers.</p>
+  <div class="case-grid">
+    <div><div id="caseList" class="case-list"></div><button type="button" id="caseNew" class="ghost wide">+ Nieuwe zaak</button></div>
+    <div id="caseDetail" hidden>
+      <h3 id="caseTitle"></h3>
+      <div id="caseItems"></div>
+      <div class="lbtns">
+        <button type="button" id="caseMerge" class="primary">Alle onderzoeken samen in één web</button>
+        <button type="button" id="caseUse" class="ghost">Nieuwe onderzoeken hierin bewaren</button>
+        <button type="button" id="caseRename" class="ghost">Naam wijzigen</button>
+        <button type="button" id="caseDelete" class="ghost">Zaak verwijderen</button>
+      </div>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="watchDlg" class="dlg">
+  <div class="dlg-head"><h2>🔔 Gevolgde adressen</h2><button class="close" id="btnWatchClose" type="button" aria-label="Sluiten">×</button></div>
+  <p class="small muted">De app controleert gevolgde adressen regelmatig (op Android ook als de app dicht is) en geeft een melding als er weer geld beweegt. Dan is het tijd om de exchange of politie te waarschuwen.</p>
+  <div id="watchList"></div>
+  <button type="button" id="btnWatchCheck" class="primary">Nu controleren</button>
+</dialog>
+
+<div id="tourRing" class="tour-ring" popover="manual" hidden></div>
+<div id="tourCap" class="tour-cap" popover="manual" hidden><p id="tourText"></p><button type="button" id="btnTourStop" class="ghost">Stop rondleiding</button></div>
 
 <footer class="foot">
   Data: mempool.space · Blockscout · TronGrid · OFAC-lijst (0xB10C) · ScamSniffer. Heuristieken zijn aanwijzingen, geen bewijs.
