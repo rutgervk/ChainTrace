@@ -434,3 +434,12 @@ body.big .layout { grid-template-columns: 400px 1fr; }
   body.big .legend-wrap .legend { width: calc((100vw - 16px) / 1.2); }
 }
 body.big .legend-wrap .legend { max-width: calc((100vw - 20px) / 1.2); }
+
+/* ---- wallets, meldpunten, instellingen ---- */
+.wallet-box, .contact-box { margin: 10px 0; padding: 10px 12px; border-radius: var(--radius); border: 1px dashed var(--accent); background: color-mix(in srgb, var(--accent) 5%, transparent); font-size: 13px; }
+.contact-box { border-style: solid; border-color: var(--exchange); background: color-mix(in srgb, var(--exchange) 7%, transparent); }
+.contact-box p { margin: 6px 0; }
+.contact-box .links { margin: 6px 0; }
+.filebtn.center { display: block; text-align: center; cursor: pointer; }
+#settingsDlg .field { margin-bottom: 12px; }
+#settingsDlg input[type=text] { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }

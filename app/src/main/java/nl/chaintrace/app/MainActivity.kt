@@ -120,10 +120,13 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Voorlezen in het Nederlands; lange teksten in stukjes (TTS heeft een maximum per stuk). */
-    private fun speakText(text: String) {
+    private var ttsLang = "nl"
+
+    private fun speakText(text: String, lang: String = "nl") {
         val go = {
             val t = tts!!
             t.stop()
+            if (lang != ttsLang) { ttsLang = lang; t.language = if (lang == "en") Locale.UK else Locale("nl", "NL") }
             val max = TextToSpeech.getMaxSpeechInputLength() - 100
             val parts = text.split(Regex("(?<=[.!?])\\s+")).flatMap { it.chunked(max) }.filter { it.isNotBlank() }
             parts.forEachIndexed { i, p ->
@@ -134,7 +137,8 @@ class MainActivity : ComponentActivity() {
         tts = TextToSpeech(this) { status ->
             ttsReady = status == TextToSpeech.SUCCESS
             if (!ttsReady) return@TextToSpeech
-            tts?.language = Locale("nl", "NL")
+            ttsLang = lang
+            tts?.language = if (lang == "en") Locale.UK else Locale("nl", "NL")
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
                 override fun onError(id: String?) { done() }
@@ -160,6 +164,9 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun speak(text: String) = runOnUiThread { speakText(text) }
+
+        @JavascriptInterface
+        fun speakLang(text: String, lang: String) = runOnUiThread { speakText(text, lang) }
 
         @JavascriptInterface
         fun stopSpeaking() = runOnUiThread { tts?.stop() }

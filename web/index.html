@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#171e26">
 <title>ChainTrace</title>
-<link rel="stylesheet" href="style.css?v=1.8">
+<link rel="stylesheet" href="style.css?v=1.9">
 </head>
 <body>
 <header class="topbar">
@@ -33,6 +33,7 @@
         <button id="btnWatch" type="button">🔔 Gevolgde adressen</button>
         <button id="btnBig" type="button">Grote letters</button>
         <button id="btnGlossary" type="button">Woordenlijst (uitleg)</button>
+        <button id="btnSettings" type="button">⚙ Instellingen</button>
       </div>
     </details>
   </div>
@@ -233,6 +234,7 @@
     <label class="field"><span>Aangifte- of zaaknummer</span><input id="lCase" type="text"></label>
     <label class="field"><span>Taal</span><select id="lLang"><option value="en">Engels (aanbevolen)</option><option value="nl">Nederlands</option></select></label>
   </div>
+  <div id="lContact"></div>
   <textarea id="lText" class="note letter-text" rows="14" spellcheck="false"></textarea>
   <div class="lbtns">
     <button id="lCopy" class="primary" type="button">Kopieer brief</button>
@@ -245,7 +247,8 @@
   <div class="dlg-head"><h2>📁 Mijn zaken</h2><button class="close" id="btnCaseClose" type="button" aria-label="Sluiten">×</button></div>
   <p class="small muted">Elk onderzoek wordt automatisch bewaard in de huidige zaak, alleen op dit apparaat. Zet meerdere onderzoeken samen in één web om verbanden te zien, zoals dezelfde oplichter bij verschillende slachtoffers.</p>
   <div class="case-grid">
-    <div><div id="caseList" class="case-list"></div><button type="button" id="caseNew" class="ghost wide">+ Nieuwe zaak</button></div>
+    <div><div id="caseList" class="case-list"></div><button type="button" id="caseNew" class="ghost wide">+ Nieuwe zaak</button>
+      <label class="ghost wide filebtn center">Back-up terugzetten<input type="file" id="caseImportFile" accept=".json,application/json" hidden></label></div>
     <div id="caseDetail" hidden>
       <h3 id="caseTitle"></h3>
       <div id="caseItems"></div>
@@ -253,10 +256,23 @@
         <button type="button" id="caseMerge" class="primary">Alle onderzoeken samen in één web</button>
         <button type="button" id="caseUse" class="ghost">Nieuwe onderzoeken hierin bewaren</button>
         <button type="button" id="caseRename" class="ghost">Naam wijzigen</button>
+        <button type="button" id="caseExport" class="ghost">Back-up maken (bestand)</button>
         <button type="button" id="caseDelete" class="ghost">Zaak verwijderen</button>
       </div>
     </div>
   </div>
+</dialog>
+
+<dialog id="settingsDlg" class="dlg dlg-small">
+  <div class="dlg-head"><h2>⚙ Instellingen</h2><button class="close" id="setClose" type="button" aria-label="Sluiten">×</button></div>
+  <label class="field"><span>Taal / Language</span><select id="setLang"><option value="nl">Nederlands</option><option value="en">English</option></select></label>
+  <label class="field"><span>Solana-server (optioneel)</span><input id="setSol" type="text" spellcheck="false" placeholder="https://mainnet.helius-rpc.com/?api-key=…">
+    <small class="hint">Leeg = gratis openbare server (20 transacties per adres, traag). Met een eigen gratis sleutel (bijv. van Helius) haalt de app er 60 per keer op.</small></label>
+  <label class="field"><span>TronGrid-sleutel (optioneel)</span><input id="setTron" type="text" spellcheck="false" placeholder="bijv. 1a2b3c4d-…">
+    <small class="hint">Gratis aan te maken op trongrid.io. Maakt Tron-onderzoek ongeveer 8× sneller.</small></label>
+  <p class="small muted">Sleutels blijven alleen op dit apparaat.</p>
+  <p id="setMsg" class="small"></p>
+  <div class="lbtns"><button type="button" id="setTest" class="ghost">Testen</button><button type="button" id="setSave" class="primary">Opslaan</button></div>
 </dialog>
 
 <dialog id="watchDlg" class="dlg">
@@ -273,12 +289,13 @@
   Data: mempool.space · Blockscout · TronGrid · OFAC-lijst (0xB10C) · ScamSniffer. Heuristieken zijn aanwijzingen, geen bewijs.
 </footer>
 
+<script src="i18n.js?v=1.9"></script>
 <script src="vendor/cytoscape.min.js"></script>
 <script src="vendor/jspdf.umd.min.js"></script>
 <script src="vendor/jspdf.plugin.autotable.min.js"></script>
 <script src="vendor/jsQR.js"></script>
-<script src="patterns.js?v=1.8"></script>
-<script src="labels.js?v=1.8"></script>
-<script src="app.js?v=1.8"></script>
+<script src="patterns.js?v=1.9"></script>
+<script src="labels.js?v=1.9"></script>
+<script src="app.js?v=1.9"></script>
 </body>
 </html>
