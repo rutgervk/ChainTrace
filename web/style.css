@@ -501,3 +501,32 @@ body.big .legend-wrap .legend { max-width: calc((100vw - 20px) / 1.2); }
 }
 #formSummaryText { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
 #formSummaryText .fs-meta { margin-left: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- v2.2: verdeling van het geld ---- */
+.tb-total { margin: 4px 0 8px; font-size: 13.5px; }
+.tb-total b { font-size: 16px; }
+.tb-bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--panel-2); margin-bottom: 8px; }
+.tb-seg { height: 100%; }
+.tb-seg.good, .tb-dot.good { background: var(--exchange); }
+.tb-seg.warn, .tb-dot.warn { background: var(--suspect); }
+.tb-seg.bad, .tb-dot.bad { background: var(--sanction); }
+.tb-seg.info, .tb-dot.info { background: #b06cff; }
+.tb-seg.muted, .tb-dot.muted { background: var(--plain); }
+.tb-row > summary { list-style: none; display: grid; grid-template-columns: 14px 1fr auto 38px; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); cursor: pointer; font-size: 13px; }
+.tb-row > summary::-webkit-details-marker { display: none; }
+.tb-row > summary b { font-variant-numeric: tabular-nums; }
+.tb-row > summary small { color: var(--muted); text-align: right; }
+.tb-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.tb-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0 4px 22px; font-size: 12.5px; }
+.tb-item .alink { flex: 1 1 auto; }
+@media (max-width: 820px) { .tb-row > summary { font-size: 14.5px; padding: 10px 0; } .tb-item { font-size: 14px; } }
+/* tablet staand: tegels op één rij, iets meer ruimte */
+@media (min-width: 600px) and (max-width: 820px) {
+  .overview { grid-template-columns: repeat(6, 1fr); }
+  .ov-tile { min-height: 72px; padding: 8px; }
+  .panel { padding-left: 24px; padding-right: 24px; }
+}
+/* tablet liggend: iets breder paneel */
+@media (min-width: 1000px) and (max-width: 1400px) and (pointer: coarse) {
+  .layout { grid-template-columns: 380px 1fr; }
+}
