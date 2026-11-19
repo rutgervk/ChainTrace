@@ -1,78 +1,130 @@
 # ChainTrace
 
-Open-source blockchain-onderzoek zonder login. Voer een walletadres in, kies **slachtoffer** of **dader** en een **fraudepatroon** — de app bouwt direct een web van geldstromen en markeert verdachte adressen met OSINT en heuristieken.
+**Open-source blockchain-onderzoek voor iedereen: geen account, geen licentie, gegevens blijven op je eigen apparaat.**
 
-Eén codebase, twee vormen:
-- **Web** — statische site in [`web/`](web/), draait in elke browser.
-- **Android** — WebView-schil (`app/`) die exact dezelfde webapp bundelt, met opslaan naar Downloads en een eigen lokale OSINT-database.
+Plak een walletadres van een slachtoffer of een dader. ChainTrace volgt het geld, laat in gewone taal zien waar het heen ging, rekent uit hoeveel er bij welke exchange terechtkwam, en maakt een rapport voor de aangifte en een kant-en-klare brief aan de exchange om het geld te laten bevriezen.
 
-Er is geen server: de app praat rechtstreeks met publieke blockchain-API's en bewaart alle OSINT op het apparaat.
+ChainTrace is gemaakt als **eerste-hulpgereedschap** voor slachtoffers, fraudehelpdesks, wijkrechercheurs, advocaten en journalisten: iedereen die geen dure analyse-licentie heeft maar wel snel moet weten waar het geld is.
 
-## Ketens en databronnen (allemaal gratis, geen API-sleutel)
+> 🇬🇧 *English summary below.*
 
-| Keten | Bron | Wat |
-|---|---|---|
-| Bitcoin | mempool.space | transacties, saldo, tx-aantal |
-| Ethereum | eth.blockscout.com | ETH + ERC-20, publieke labels (bv. "Binance: Hot Wallet"), ENS, scam-vlag |
-| Optimism | explorer.optimism.io (Blockscout) | idem |
-| Tron | TronGrid | TRC-20 (USDT/USDC), nep-token-detectie |
+| Tablet / computer | Telefoon |
+|---|---|
+| ![Overzicht met verdeling van het geld en uitleg per adres](docs/screenshots/tablet-verkenner.jpg) | ![Overzicht op de telefoon](docs/screenshots/telefoon-overzicht.jpg) |
+| ![Tijdlijn van alle betalingen](docs/screenshots/tablet-tijdlijn.jpg) | ![Het web met wallets en de geldroute](docs/screenshots/telefoon-web.jpg) |
 
-OSINT-lijsten: OFAC-sanctieadressen ([0xB10C](https://github.com/0xB10C/ofac-sanctioned-digital-currency-addresses)), [ScamSniffer](https://github.com/scamsniffer/scam-database)-blacklist, een kleine eigen labelset (`web/labels.js`) en eigen labels (lokaal opgeslagen). Per adres zijn er zoeklinks naar Chainabuse, Breadcrumbs, Arkham, Google, X, Reddit, GitHub en Telegram.
+*Schermafdrukken van de ingebouwde voorbeeldzaak (verzonnen gegevens).*
 
-## Lokale OSINT-database (Android)
+---
 
-De app houdt een SQLite-database bij (`osint.db`, ca. 200 MB) die via WorkManager **dagelijks** wordt bijgewerkt (eerste keer direct na installatie, alleen met netwerk). Via **Database** in de app zie je per bron de status, kun je zoeken op adres of label en handmatig bijwerken.
+## Wat kan het?
 
-| Bron | Inhoud | Records (nov 2026) |
-|---|---|---|
-| [OFAC (0xB10C)](https://github.com/0xB10C/ofac-sanctioned-digital-currency-addresses) | sanctieadressen BTC/ETH/TRX/USDT/USDC/LTC/… | ~1.000 |
-| [ScamSniffer](https://github.com/scamsniffer/scam-database) | drainers/scams (EVM) | ~2.500 |
-| [MyEtherWallet darklist](https://github.com/MyEtherWallet/ethereum-lists) | phishing/scam (EVM) | ~650 |
-| [Forta labelled datasets](https://github.com/forta-network/labelled-datasets) | phishing, kwaadaardige contracten + makers | ~7.000 |
-| [Etherscan-labels](https://github.com/brianleect/etherscan-labels) | exchanges, protocollen, hacks (EVM) | ~30.000 |
-| [Ransomwhere](https://ransomwhe.re) | ransomware-betaaladressen per familie | ~11.000 |
-| [GraphSense tagpacks](https://github.com/graphsense/graphsense-tagpacks) | exchanges, mixers, darknet, scams (BTC/ETH/TRX) | ~500.000 |
-| Tether USDT-blacklist (Tron, TronGrid) | bevroren adressen, opheffingen verwerkt | ~8.000 |
-| Tether USDT-blacklist (Ethereum, Blockscout) | bevroren adressen, opheffingen verwerkt | ~3.000 |
+**Het geld volgen**
+- Volgt geld vanaf een adres over meerdere stappen, **in tijdsvolgorde** (alleen geld dat vertrok nadat het binnenkwam).
+- **8 blockchains**: Bitcoin, Ethereum, Optimism, Avalanche, zkSync Era, Tron (TRC-20 én TRX), Solana en Litecoin. Bij een 0x-adres dat op meerdere ketens actief is, vraagt de app welke.
+- Volgt geld **door swaps** (omwisselen bij een DEX) en **over bridges** naar een andere blockchain (deBridge, Across, LayerZero/Stargate).
+- **Herkomst**: zoekt terug waar het geld vandaan kwam — startwallets (mogelijke andere slachtoffers) en instroom vanaf exchanges.
 
-Daarnaast slaat de app na elke trace **eigen waarnemingen** op (adres, rol, classificatie, zaak). Komt een adres later in een andere zaak terug, dan meldt de app "eerder als dader/verdacht gezien". Eigen labels gaan ook de database in.
+**Begrijpen wat je ziet**
+- **"Waar is het geld gebleven?"** — verdeling van het geld van het slachtoffer in euro (waarde op de dag van betaling): bij exchanges, op stortingsadressen, nog op adressen, naar mixers, via bridges, nog niet gevolgd.
+- **"Het geld stap voor stap"** — de route in gewone zinnen, van slachtoffer tot exchange.
+- **Stortingsadressen**: herkent het persoonlijke klant-stortingsadres bij een exchange — het adres waarmee de exchange de klant kan vinden.
+- **Wallets en beheerders**: voegt adressen van dezelfde eigenaar samen met eigen regels (zie [methodes](docs/METHODS.md)).
+- Uitleg in gewone taal bij elk adres, een woordenlijst, voorlezen, grote letters, en een ingebouwde rondleiding met een voorbeeldzaak.
 
-De webversie heeft geen lokale database en laadt OFAC en ScamSniffer direct bij het traceren.
+**Actie ondernemen**
+- **Brief aan de exchange** (Engels of Nederlands) om tegoeden te bevriezen en gegevens te bewaren, al ingevuld met adressen, transacties, het geschatte bedrag en het **officiële politie-meldpunt** van de exchange (Binance, Coinbase, OKX, KuCoin, Kraken, Bybit, Bitvavo, Tether).
+- **PDF-rapport** met samenvatting, web, routes, tijdlijn, verdachte adressen en transacties met volledige hash, plus een **controleerbaar dossierbestand** met SHA-256-vingerafdruk en de bron en ophaaltijd van elk gegeven. Op de telefoon direct te delen via mail of WhatsApp.
+- **Volgen**: een adres of hele wallet volgen en een melding krijgen zodra er weer geld beweegt (op Android ook als de app dicht is).
+- **Mijn zaken**: onderzoeken worden automatisch per zaak bewaard, kunnen samen in één web, en als back-upbestand worden bewaard.
 
-## Heuristieken
-- **Exchange/dienst** (label of zeer hoog tx-volume) → cash-out-punt, trace stopt daar
-- **Doorsluisadres** — ≥60% van de inkomende stortingen binnen 1 uur doorgestort
-- **Fan-in / fan-out** — ≥10 afzenders/ontvangers (verzameladres, layering)
-- **Peel chain** (BTC) — herhaalde 2-output-transacties met ≥80% in één output
-- **Address poisoning** — tegenpartijen met hetzelfde begin/eind, nul- of nep-tokentransfers
-- **Sanctie / scamlijst / mixer / bridge**
+**Werkt overal**
+- Webversie (elke browser) en Android-app uit dezelfde code; geschikt voor telefoon (vanaf 6 inch), tablet en computer.
+- Nederlands en Engels.
 
-Rol en patroon bepalen de richting: bij een slachtoffer volgt de app het geld vooruit naar de dader(s); bij een dader toont hij ook de inkomende kant (mogelijke andere slachtoffers). Elk patroon heeft eigen diepte, focus en vervolgstappen.
+---
 
-> Heuristieken zijn aanwijzingen, geen bewijs. Gebruik de resultaten als startpunt voor een aangifte of verder onderzoek.
+## Installeren en draaien
 
-## Draaien
+**Android**: download de APK bij [Releases](../../releases) en installeer hem (Android vraagt om toestemming voor installatie buiten de Play Store).
 
-Web (lokaal):
+**Web, lokaal**
 ```bash
 python -m http.server 8765 --directory web
 ```
-Open daarna http://localhost:8765. De map `web/` kan ook op elke statische host (GitHub Pages, Netlify) worden gezet.
+Open http://localhost:8765. De map `web/` is een statische site en kan op elke statische host (bijv. GitHub Pages).
 
-Android:
+**Android zelf bouwen**
 ```bash
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## Rapporten en export
-- **PDF-rapport** — zaakgegevens, samenvatting in gewone taal, het geldstroom-web, verdachte adressen, verdachte transacties (tijdstip, van, naar, bedrag, volledige hash), cash-out bij exchanges, instroom vanuit exchanges, startwallets, alle adressen, notities en vervolgstappen.
-- **Afbeelding** — rapport als PNG (licht of donker) of alleen het web in hoge resolutie.
-- **Herkomst-CSV** — startwallets en exchange-instroom met hash en tijdstip.
-- **Dossier (JSON)** — alles, opnieuw te openen in de app.
+**Optioneel**: onder *Meer → Instellingen* kun je een eigen (gratis) Solana-server en TronGrid-sleutel invullen voor meer en snellere resultaten. Sleutels blijven op het apparaat.
 
-## Herkomst van het geld
-Na elke trace volgt de app het inkomende geld terug tot een exchange/dienst (instroompunt, met hash en tijdstip) of een **startwallet**: een adres zonder eerdere instroom of rechtstreeks gevuld vanuit een exchange — mogelijk een ander slachtoffer.
+---
+
+## Databronnen (gratis, zonder sleutel)
+
+| Wat | Bron |
+|---|---|
+| Bitcoin / Litecoin | mempool.space, litecoinspace.org |
+| Ethereum, Optimism | Blockscout (incl. publieke labels zoals "Binance: Hot Wallet") |
+| Avalanche | Routescan |
+| zkSync Era | zkSync block explorer API |
+| Tron | TronGrid |
+| Solana | PublicNode RPC (of eigen server) |
+| Bridges | deBridge, Across, LayerZero scan |
+| Koersen in euro | Binance (dagkoersen) |
+
+### Lokale OSINT-database (Android)
+
+De Android-app houdt een eigen database bij (ca. 200 MB) die dagelijks wordt bijgewerkt. Daarin staat ook de eigen geschiedenis: komt een adres later in een andere zaak terug, dan meldt de app "eerder gezien".
+
+| Bron | Inhoud |
+|---|---|
+| [OFAC (0xB10C)](https://github.com/0xB10C/ofac-sanctioned-digital-currency-addresses) | sanctieadressen |
+| [ScamSniffer](https://github.com/scamsniffer/scam-database) | drainers / scams (EVM) |
+| [MyEtherWallet darklist](https://github.com/MyEtherWallet/ethereum-lists) | phishing / scam (EVM) |
+| [Forta labelled datasets](https://github.com/forta-network/labelled-datasets) | phishing, kwaadaardige contracten |
+| [Etherscan-labels](https://github.com/brianleect/etherscan-labels) | exchanges, protocollen, hacks |
+| [Ransomwhere](https://ransomwhe.re) | ransomware-betaaladressen |
+| [GraphSense tagpacks](https://github.com/graphsense/graphsense-tagpacks) | exchanges, mixers, darknet, scams |
+| Tether USDT-blacklist (Tron en Ethereum) | door Tether bevroren adressen, inclusief opheffingen |
+
+De webversie heeft geen lokale database en laadt OFAC en ScamSniffer rechtstreeks.
+
+---
+
+## Methodes en betrouwbaarheid
+
+Alle regels die de app gebruikt — tijdsvolgorde, wallet-herkenning, stortingsadressen, de proportionele verdeling (haircut), bridges en swaps — staan beschreven in **[docs/METHODS.md](docs/METHODS.md)**, inclusief hun beperkingen.
+
+> **Belangrijk:** de uitkomsten zijn **aanwijzingen, geen bewijs**. ChainTrace kijkt per adres naar de recentste transacties, kent alleen openbare labels en maakt schattingen. Controleer transacties altijd met de transactie-hash in een block explorer. Voor zware zaken is verdere analyse door de politie of een specialist nodig.
+
+## Privacy
+
+Er is geen server en geen account. Onderzoeken, notities, zaken en sleutels blijven op het apparaat. De app vraagt alleen openbare blockchaingegevens op bij de hierboven genoemde diensten.
+
+## Bijdragen
+
+Meldingen en verbeteringen zijn welkom via Issues en Pull requests. Er is een zelftest in [`tests/`](tests/) die de belangrijkste functies controleert met echte blockchaingegevens.
 
 ## Licentie
-MIT
+
+[MIT](LICENSE). Meegeleverde bibliotheken: zie [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
+## English summary
+
+**ChainTrace** is a free, open-source blockchain investigation tool for people without a forensic-analytics licence: victims, fraud help desks, local police, lawyers and journalists. No account, no server — data stays on your device.
+
+Paste a victim's or perpetrator's address and ChainTrace will:
+- follow the money (time-ordered) across Bitcoin, Ethereum, Optimism, Avalanche, zkSync Era, Tron, Solana and Litecoin, including through DEX swaps and bridges (deBridge, Across, LayerZero/Stargate);
+- explain each address in plain language, detect customer deposit addresses at exchanges and cluster addresses of the same owner with transparent built-in rules;
+- estimate where the victim's money ended up, in euros at the time of payment (proportional/haircut method);
+- generate a freeze/preservation request letter to the exchange with its verified law-enforcement channel, and a PDF report with a verifiable evidence file (SHA-256);
+- watch addresses or whole wallets and notify you when funds move.
+
+Web app (any browser) and Android app from one codebase; Dutch and English UI. Methods and limitations: [docs/METHODS.md](docs/METHODS.md). Results are indications, not proof.
