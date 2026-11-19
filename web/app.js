@@ -857,12 +857,18 @@ async function runTrace(addr, chain, role, pattern, opts) {
   lightAnalyze(seed);
   scheduleRender();
   let level = [{ n: seed, depth: 0, dir: window.PATTERNS[pattern].dir[role] }];
+  let hop = 0;
+  const steps = opts.depth + 1;
   while (level.length && !stopped) {
+    setProgress(hop, steps, `Stap ${hop + 1} van ${steps}: geld volgen`);
     const results = await Promise.all(level.map(x => expand(x.n, x.depth, x.dir)));
     level = results.flat().filter(x => !x.n.expanded);
+    hop++;
   }
   // Automatisch de herkomst van het geld zoeken: startwallets en exchange-instroom.
+  setProgress(steps - 1, steps, `Stap ${steps} van ${steps}: herkomst zoeken`);
   if (!stopped) await traceOrigins(seed, { depth: role === 'perp' ? Math.max(3, opts.depth) : 2, fanIn: Math.max(4, opts.fanout) });
+  setProgress(null);
   setBusy(false);
   render(true);
   renderPlaybook();
@@ -1063,6 +1069,7 @@ function cyStyle(themeName) {
       'background-color': '#4ea1ff', 'background-opacity': 0.07, 'border-style': 'dashed', 'border-width': 2, 'border-color': '#4ea1ff',
       shape: 'round-rectangle', label: 'data(label)', 'text-valign': 'top', 'text-halign': 'center', 'text-margin-y': -4, 'font-size': 10, color: t.muted, padding: 14
     } },
+    { selector: 'node', style: { 'font-size': isMobile() ? 13 : 10, 'text-max-width': isMobile() ? 140 : 170 } },
     { selector: 'node[?seed]', style: { 'border-width': 4, 'border-color': t.seedBorder, 'font-weight': 'bold', 'font-size': 12 } },
     { selector: 'node[?flagged]', style: { 'border-color': '#ff4d5e', 'border-style': 'double', 'border-width': 4 } },
     { selector: 'node[?noted]', style: { 'background-image-opacity': 1, 'underlay-color': '#f5c518', 'underlay-opacity': 0.35, 'underlay-padding': 5, 'underlay-shape': 'ellipse' } },
@@ -1101,6 +1108,7 @@ function scheduleRender() {
 
 function render(final) {
   if (!cy) initCy();
+  updateProgress();
   detectDeposits();
   $('#empty').hidden = nodes.size > 0;
   const maxUsd = Math.max(1, ...[...edges.values()].map(e => e.usd || Object.values(e.assets)[0] || 0));
@@ -1110,7 +1118,7 @@ function render(final) {
       const label = labelOf(n);
       const data = {
         id: n.key, label: (notes.nodes[n.key] ? '✎ ' : '') + (label ? `${label}\n${short(n.addr)}` : short(n.addr)), color: COLORS[cls],
-        size: n.seed ? 44 : isEndpoint(n) ? 34 : 26, seed: !!n.seed, flagged: n.flags.some(f => f.level === 'high'), noted: !!notes.nodes[n.key]
+        size: (n.seed ? 44 : isEndpoint(n) ? 34 : 26) * (isMobile() ? 1.45 : 1), seed: !!n.seed, flagged: n.flags.some(f => f.level === 'high'), noted: !!notes.nodes[n.key]
       };
       const el = cy.getElementById(n.key);
       if (el.nonempty()) el.data(data);
@@ -1144,6 +1152,20 @@ function render(final) {
 }
 
 let graphStale = false;
+const PHONE_MIN_ZOOM = 0.7;
+// Inzoomen op de geldroute (startadres + routes); op de telefoon met een minimale zoom.
+function fitRoute() {
+  if (!cy || !cy.nodes().length) return;
+  const keys = new Set([current?.seedKey]);
+  for (const r of moneyRoutes(5).routes) for (const e of r.steps) { keys.add(e.source); keys.add(e.target); }
+  const els = cy.nodes().filter(n => keys.has(n.id()));
+  cy.fit(els.length > 1 ? els : cy.nodes(), 30);
+  if (isMobile() && cy.zoom() < PHONE_MIN_ZOOM) {
+    const seed = cy.getElementById(current?.seedKey);
+    cy.zoom({ level: PHONE_MIN_ZOOM, position: seed.nonempty() ? seed.position() : els.boundingBox ? { x: els.boundingBox().x1 + els.boundingBox().w / 2, y: els.boundingBox().y1 + els.boundingBox().h / 2 } : undefined });
+    if (seed.nonempty()) cy.center(seed);
+  }
+}
 function runLayout(fit) {
   if (!cy || cy.nodes().length === 0) return;
   // Web niet zichtbaar (telefoon, andere tab): later schikken als het weer in beeld komt.
@@ -1169,6 +1191,8 @@ function runLayout(fit) {
   cy.fit(undefined, 40);
   // Bij heel weinig adressen niet extreem inzoomen.
   if (cy.zoom() > 1.4) { cy.zoom(1.4); cy.center(); }
+  // Telefoon: nooit zo ver uitzoomen dat adressen te klein worden om aan te tikken; dan liever de route tonen.
+  if (isMobile() && cy.zoom() < PHONE_MIN_ZOOM) fitRoute();
 }
 
 function renderFindings() {
@@ -1718,6 +1742,25 @@ function exploreQuery(q) {
 }
 
 // ---------- export / import ----------
+// Na opslaan: "Delen" aanbieden (Android-deelmenu, of de deelfunctie van de browser op een telefoon).
+function offerShare(name, mime, dataUrl) {
+  const b64 = dataUrl.split(',')[1];
+  const canWeb = !!(navigator.canShare && window.File);
+  if (!window.AndroidBridge?.shareFile && !canWeb) return;
+  const bar = $('#shareBar');
+  bar.hidden = false;
+  $('#shareText').textContent = `${name} is opgeslagen.`;
+  $('#shareBtn').onclick = async () => {
+    if (window.AndroidBridge?.shareFile) { window.AndroidBridge.shareFile(name, mime, b64); return; }
+    const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const file = new File([bin], name, { type: mime });
+    if (navigator.canShare({ files: [file] })) navigator.share({ files: [file], title: name }).catch(() => {});
+  };
+  $('#shareClose').onclick = () => { bar.hidden = true; };
+  clearTimeout(offerShare.t);
+  offerShare.t = setTimeout(() => { bar.hidden = true; }, 30000);
+}
+
 function saveFile(name, mime, dataUrlOrText, isDataUrl) {
   if (window.AndroidBridge?.saveFile) {
     const b64 = isDataUrl ? dataUrlOrText.split(',')[1] : btoa(unescape(encodeURIComponent(dataUrlOrText)));
@@ -2196,7 +2239,10 @@ async function exportPdf() {
       doc.text(S(`ChainTrace ${APP_VERSION}  |  ${short(seed.addr)}  |  ${new Date().toLocaleDateString(window.CT_LOCALE)}  |  SHA-256 ${hash.slice(0, 12)}…`), M, 291);
       doc.text(S(`Pagina ${i} van ${pages}`), W - M, 291, { align: 'right' });
     }
-    saveFile(`chaintrace-rapport-${stamp()}.pdf`, 'application/pdf', doc.output('datauristring'), true);
+    const pdfName = `chaintrace-rapport-${stamp()}.pdf`;
+    const pdfData = doc.output('datauristring');
+    saveFile(pdfName, 'application/pdf', pdfData, true);
+    offerShare(pdfName, 'application/pdf', pdfData);
     saveFile(evName, 'application/json', evText, false);
     setStatus(`PDF-rapport en dossierbestand opgeslagen (${pages} pagina's).`);
     return doc;
@@ -2258,7 +2304,25 @@ function resetGraph() {
 }
 
 function setStatus(t, err = false) { const s = $('#status'); s.textContent = t; s.classList.toggle('err', err); }
-function setBusy(b) { $('#btnTrace').disabled = b; $('#btnStop').hidden = !b; }
+function setBusy(b) { $('#btnTrace').disabled = b; $('#btnStop').hidden = !b; if (!b) setProgress(null); }
+// Voortgangsbalk: stap i van n (met een kleine tussenstand op basis van geladen adressen).
+let progressStep = null;
+function setProgress(i, n, label) {
+  const box = $('#progress');
+  if (i == null) { box.hidden = true; progressStep = null; return; }
+  progressStep = { i, n, label };
+  box.hidden = false;
+  $('#progressLabel').textContent = label;
+  updateProgress();
+}
+function updateProgress() {
+  if (!progressStep) return;
+  const loaded = [...nodes.values()].filter(x => x.data).length;
+  const { i, n } = progressStep;
+  const frac = Math.min(0.9, loaded / Math.max(4, (current?.opts?.fanout || 6) * (i + 1)));
+  $('#progressFill').style.width = Math.min(100, 100 * (i + frac) / n) + '%';
+  $('#progressCount').textContent = `${loaded} adressen opgehaald`;
+}
 
 function readOpts() {
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
@@ -2377,6 +2441,7 @@ function setup() {
   $('#btnLayoutWeb').addEventListener('click', () => setLayout('web'));
   $('#btnLayoutFlow').addEventListener('click', () => setLayout('flow'));
   $('#btnFit').addEventListener('click', () => cy?.fit(undefined, 40));
+  $('#btnRoute').addEventListener('click', () => { if (document.querySelector('#timeline') && !$('#timeline').hidden) setGraphView('web'); fitRoute(); });
 
   setupDbDialog();
   setupSimple();
@@ -3630,7 +3695,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '2.2';
+const APP_VERSION = '2.3';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';

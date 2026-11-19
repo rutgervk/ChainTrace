@@ -240,6 +240,26 @@ class MainActivity : ComponentActivity() {
             runCatching { db.setUserLabel(chain, address, label) }.onFailure { Log.e(TAG, "saveUserLabel", it) }
         }
 
+        /** Bestand (bv. het PDF-rapport) delen via het Android-deelmenu: mail, WhatsApp, Drive… */
+        @JavascriptInterface
+        fun shareFile(name: String, mime: String, base64: String) {
+            runCatching {
+                val dir = File(cacheDir, "share").apply { mkdirs() }
+                val f = File(dir, name.replace(Regex("[^A-Za-z0-9._-]"), "_"))
+                f.writeBytes(Base64.decode(base64, Base64.DEFAULT))
+                val uri = androidx.core.content.FileProvider.getUriForFile(this@MainActivity, "$packageName.files", f)
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = mime
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    // ClipData zorgt dat de leesrechten ook naar het deelmenu zelf (voorbeeld) en de gekozen app gaan.
+                    clipData = android.content.ClipData.newRawUri(f.name, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                val chooser = Intent.createChooser(send, "Delen via").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                runOnUiThread { startActivity(chooser) }
+            }.onFailure { Log.e(TAG, "shareFile", it) }
+        }
+
         @JavascriptInterface
         fun saveFile(name: String, mime: String, base64: String) {
             val safeName = name.replace(Regex("[^A-Za-z0-9._-]"), "_")

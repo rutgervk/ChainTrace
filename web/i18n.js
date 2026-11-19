@@ -389,6 +389,8 @@ const PDF_EXTRA = {
   'Programma': 'Program', 'Rapport gemaakt (UTC)': 'Report created (UTC)', 'Instellingen': 'Settings', 'Tijdvolgorde': 'Time order', 'aan': 'on', 'uit': 'off',
   'Alleen geld gevolgd dat vertrok nadat het op het adres binnenkwam.': 'Only money that left after it arrived at the address was followed.',
   'Uit: alle uitgaande betalingen gevolgd.': 'Off: all outgoing payments followed.',
+  // v2.3
+  'Route': 'Route', 'Delen': 'Share',
   // v2.2
   'Waar is het geld gebleven?': 'Where did the money end up?', 'Het slachtoffer verstuurde': 'The victim sent', '(waarde op de dag zelf).': '(value on the day itself).',
   'Bij exchanges': 'At exchanges', 'Op stortingsadressen bij exchanges': 'On deposit addresses at exchanges', 'Staat nog op adressen': 'Still on addresses',
@@ -430,6 +432,8 @@ patterns.push(
   ['PDF-rapport en dossierbestand opgeslagen ({#0} pagina\'s).', 'PDF report and evidence file saved ({0} pages).'],
   ['Berekend met de proportionele methode (haircut): als geld van het slachtoffer zich mengt met ander geld, gaat bij elke betaling naar verhouding een deel mee. Dit is een schatting op basis van de geladen transacties; {#0} betaling(en) zonder bekende koers telden niet mee.',
     "Calculated with the proportional (haircut) method: when the victim's money mixes with other money, each payment carries a proportional share. This is an estimate based on the loaded transactions; {0} payment(s) without a known price were not counted."],
+  ['{0} is opgeslagen.', '{0} has been saved.'], ['Stap {#0} van {#1}: geld volgen', 'Step {0} of {1}: following the money'],
+  ['Stap {#0} van {#1}: herkomst zoeken', 'Step {0} of {1}: tracing the origin'], ['{#0} adressen opgehaald', '{0} addresses fetched'],
   ['{0} zette {1} via {2} over naar {3} op {4}.', '{0} moved {1} via {2} to {3} on {4}.'], ['{0} wisselde om via {1} en stuurde {2} naar {3}.', '{0} swapped via {1} and sent {2} to {3}.'],
   ['Bridge-overboeking natrekken ({0})…', 'Checking bridge transfer ({0})…'], ['Ontving geld via {0} vanaf {1}', 'Received money via {0} from {1}'],
   ['Geld ging via {0} naar {1} (ontvanger {2}): daar kan ChainTrace niet verder volgen', 'Money went via {0} to {1} (recipient {2}): ChainTrace cannot follow it there'],
