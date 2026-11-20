@@ -70,3 +70,10 @@ Beperkingen: betalingen zonder bekende koers tellen niet mee (de app meldt hoeve
 - Geen volledige indexering van de blockchain: wallets worden alleen samengevoegd binnen de geladen gegevens.
 - Geen ondersteuning voor privacy-munten (bijv. Monero) en geen "demixing" na mixers.
 - Ketens buiten de 8 ondersteunde (bijv. Arbitrum, Base, BNB Chain, Polygon) worden herkend als bestemming van een bridge, maar niet verder gevolgd.
+
+## 9. Samenwerken via de teamserver (optioneel)
+
+- Een ☁ teamzaak wordt na elke wijziging (±1,5 s) als dossier naar de teamserver gestuurd. Alleen-kijken-leden slaan niets op in de teamzaak; hun eigen onderzoeken gaan naar een eigen zaak op het apparaat.
+- **Gelijktijdig bewerken**: de app stuurt mee op welke versie de wijziging is gebaseerd. Heeft iemand anders intussen opgeslagen, dan weigert de server (409); de app haalt die versie op en voegt hem samen met de eigen versie: alle adressen, kenmerken en geldstromen van beide blijven bestaan. De notitie bij de zaak en eigen labels van de laatste opslag blijven staan; gebruik voor overleg de opmerkingen bij de zaak.
+- Elke ±20 seconden kijkt de app of er iets is gewijzigd. Is het geopende onderzoek door een ander bijgewerkt, dan verschijnt een melding met de knop om de nieuwe versie te openen.
+- Het activiteitenlog legt vast wie wanneer een onderzoek toevoegde, bijwerkte of verwijderde, leden en deellinks beheerde en opmerkingen plaatste. Het SHA-256-dossier voor het PDF-rapport wordt zoals altijd op het eigen apparaat gemaakt.

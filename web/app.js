@@ -52,6 +52,7 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* opslag niet beschikbaar */ } }
 };
 let customLabels = store.get('chaintrace.labels', {});
+let teamLabels = {}; // gedeelde labels van de teamserver (optioneel)
 
 // ---------- lokale OSINT-database (alleen in de Android-app) ----------
 const LOCAL_DB = !!window.AndroidBridge?.osintLookup;
@@ -625,6 +626,7 @@ function addToGraph(n) {
 
 function labelOf(n) {
   if (customLabels[n.key]) return customLabels[n.key];
+  if (teamLabels[n.key]) return teamLabels[n.key];
   const known = window.KNOWN_LABELS[n.addr] || window.KNOWN_LABELS[Object.keys(window.KNOWN_LABELS).find(k => k.toLowerCase() === n.addr) || ''];
   if (known) return known.name;
   const m = metaStore[n.key];
@@ -649,7 +651,7 @@ function lightAnalyze(n) {
   if (isEvm(n.chain) && osint.scam?.has(lower)) addFlag(n, 'scamlist', 'high', 'Op ScamSniffer-blacklist');
   const m = metaStore[n.key];
   const known = window.KNOWN_LABELS[n.addr];
-  const text = [customLabels[n.key], known?.name, ...(m?.tags || []), m?.name].filter(Boolean).join(' ');
+  const text = [customLabels[n.key], teamLabels[n.key], known?.name, ...(m?.tags || []), m?.name].filter(Boolean).join(' ');
   if (m?.scam) addFlag(n, 'scamlist', 'high', 'Door Blockscout als scam gemarkeerd');
   if (m?.reputation) addFlag(n, 'reputation', 'med', `Reputatie: ${m.reputation}`);
   if (MIXER_RE.test(text)) addFlag(n, 'mixer', 'high', 'Mixer / privacy-dienst');
@@ -1680,6 +1682,7 @@ async function nodeAction(n, act) {
     if (v === null) return;
     if (v.trim()) customLabels[n.key] = v.trim(); else delete customLabels[n.key];
     store.set('chaintrace.labels', customLabels);
+    teamPushLabel(n, v.trim());
     if (LOCAL_DB) { try { window.AndroidBridge.saveUserLabel(n.chain, n.addr, v.trim()); } catch { /* niet fataal */ } dbCache.delete(n.key); }
     n.flags = n.flags.filter(f => f.code !== 'exchange');
     lightAnalyze(n);
@@ -2425,7 +2428,7 @@ function setup() {
   $('#btnExpGraph').addEventListener('click', () => exportReport('graph'));
   $('#btnExpClose').addEventListener('click', () => $('#exportDialog').close());
   $('#btnOriginsCsv').addEventListener('click', () => saveFile(`chaintrace-herkomst-${stamp()}.csv`, 'text/csv', '\ufeff' + originsCsv(), false));
-  $('#caseNote').addEventListener('input', ev => { notes.case = ev.target.value; saveNotes(); });
+  $('#caseNote').addEventListener('input', ev => { notes.case = ev.target.value; saveNotes(); autosave(); });
   $('#fileImport').addEventListener('change', async ev => {
     const f = ev.target.files[0];
     if (!f) return;
@@ -2450,6 +2453,7 @@ function setup() {
   setupV20();
   setupUI21();
   setupV22();
+  setupTeam();
 
   // Tabbalk (telefoon), zoeken in de verkenner en het kaartje onder in het web.
   document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
@@ -2991,6 +2995,394 @@ const cases = {
   setCurrent: id => store.set('chaintrace.case', id)
 };
 const caseById = id => cases.list().find(c => c.id === id);
+// ---------- Teamserver (optioneel): samenwerken en zaken delen ----------
+// Zonder ingestelde server doet dit niets: de app werkt dan volledig zelfstandig zoals voorheen.
+let teamSameOrigin = false;
+const team = {
+  cfg: () => store.get('chaintrace.team', {}),
+  setCfg: c => store.set('chaintrace.team', c),
+  base: () => ((team.cfg().url || (teamSameOrigin ? location.origin : '')) + '').replace(/\/+$/, ''),
+  on: () => !!(team.base() && team.cfg().token),
+  me: () => team.cfg().username || '',
+  isTeam: c => !!c?.team,
+  canEdit: c => !c?.team || c.team.role !== 'view'
+};
+async function teamApi(method, path, body, { auth = true, base } = {}) {
+  const url = (base || team.base()) + '/api/' + path;
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (auth && team.cfg().token) headers.Authorization = 'Bearer ' + team.cfg().token;
+  let r;
+  try { r = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, cache: 'no-store' }); }
+  catch { throw new Error('Teamserver niet bereikbaar. Controleer het adres en de internetverbinding.'); }
+  let j = {};
+  try { j = await r.json(); } catch { /* geen JSON */ }
+  if (r.status === 401 && auth && team.cfg().token) { const c = team.cfg(); delete c.token; team.setCfg(c); renderTeamState(); }
+  if (!r.ok) throw new Error(j.error || `Fout van de teamserver (${r.status})`);
+  return j;
+}
+const teamCaseId = sid => 't_' + sid;
+function teamItem(i) {
+  return { seedKey: i.seedKey, chain: i.chain, addr: i.addr, role: i.role, pattern: i.pattern || '', title: i.title || short(i.addr || i.seedKey), saved: i.updated, size: i.size || 0, by: i.updatedBy };
+}
+// Haal de teamzaken op en zet ze naast de eigen (lokale) zaken.
+async function teamSync() {
+  if (!team.on()) return;
+  const { cases: list } = await teamApi('GET', 'cases');
+  const base = team.base();
+  const l = cases.list().filter(c => !(c.team && c.team.srv === base && !list.some(s => teamCaseId(s.id) === c.id)));
+  for (const s of list) {
+    const id = teamCaseId(s.id);
+    const c = l.find(x => x.id === id);
+    const v = { id, name: s.name, created: s.created, updated: s.updated, items: s.items.map(teamItem), team: { id: s.id, srv: base, role: s.role, owner: s.owner, members: s.members } };
+    if (c) Object.assign(c, v); else l.push(v);
+  }
+  cases.save(l);
+  if (!caseById(cases.currentId())) cases.setCurrent(null);
+  renderCaseBar();
+  if ($('#caseDlg').open) renderCases();
+}
+async function teamLoadLabels() {
+  if (!team.on()) return;
+  try {
+    const { labels } = await teamApi('GET', 'labels');
+    teamLabels = {};
+    for (const x of labels) teamLabels[keyOf(x.chain, x.address)] = x.label;
+    for (const n of nodes.values()) if (teamLabels[n.key]) lightAnalyze(n);
+    if (nodes.size) { render(false); refreshView(); }
+  } catch { /* volgende keer */ }
+}
+function teamPushLabel(n, label) {
+  if (!team.on()) return;
+  if (label) teamLabels[n.key] = label; else delete teamLabels[n.key];
+  teamApi('PUT', 'labels', { chain: n.chain, address: n.addr, label }).catch(e => setStatus(e.message, true));
+}
+let teamLoaded = null; // { caseId, seedKey, at, sig } — het geopende teamonderzoek (at = versie op de server)
+const dossierSig = d => JSON.stringify({ ...d, exported: 0 });
+async function teamPushItem(c, item, dossier, retry = 0) {
+  if (!team.on() || !c.team || c.team.srv !== team.base() || !team.canEdit(c)) return;
+  const same = teamLoaded && teamLoaded.caseId === c.id && teamLoaded.seedKey === item.seedKey;
+  const sig = dossierSig(dossier);
+  if (same && teamLoaded.sig === sig) return; // niets veranderd (bijv. alleen geopend)
+  const path = `cases/${encodeURIComponent(c.team.id)}/items/${encodeURIComponent(item.seedKey)}`;
+  try {
+    const r = await teamApi('PUT', path, { base: same ? teamLoaded.at : undefined,
+      meta: { chain: item.chain, addr: item.addr, role: item.role, pattern: item.pattern, title: item.title, size: item.size }, dossier });
+    teamLoaded = { caseId: c.id, seedKey: item.seedKey, at: r.updated, sig };
+    setTeamSync('ok');
+  } catch (e) {
+    // Een teamgenoot heeft intussen opgeslagen: diens versie samenvoegen met de onze en opnieuw opslaan.
+    if (/Intussen/.test(e.message) && retry < 2 && current?.seedKey === item.seedKey) {
+      const r = await teamApi('GET', path);
+      importJson(r.dossier, { merge: true });
+      render(true); renderSummary(); refreshView();
+      teamLoaded = { caseId: c.id, seedKey: item.seedKey, at: r.updated, sig: '' };
+      setStatus(`Samengevoegd met de wijzigingen van ${r.updatedBy || 'een teamgenoot'}.`);
+      const merged = buildDossier();
+      return teamPushItem(c, { ...item, size: nodes.size }, merged, retry + 1);
+    }
+    setTeamSync('err', e.message);
+  }
+}
+function setTeamSync(state, msg) {
+  const el = $('#teamSync');
+  if (!el) return;
+  el.hidden = !team.on() || !caseById(cases.currentId())?.team;
+  el.className = 'team-sync ' + state;
+  el.textContent = state === 'ok' ? '☁ gedeeld' : state === 'err' ? '⚠ niet gedeeld' : '☁';
+  el.title = msg || (state === 'ok' ? 'Opgeslagen op de teamserver' : '');
+}
+async function teamOpenItem(c, seedKey) {
+  const r = await teamApi('GET', `cases/${encodeURIComponent(c.team.id)}/items/${encodeURIComponent(seedKey)}`);
+  try { await idb.set(`dossier:${c.id}:${seedKey}`, r.dossier); } catch { /* alleen cache */ }
+  teamLoaded = { caseId: c.id, seedKey, at: r.updated, sig: dossierSig(r.dossier) };
+  return r.dossier;
+}
+// Lokale zaak naar de teamserver brengen.
+async function teamUpload(c) {
+  const { case: s } = await teamApi('POST', 'cases', { name: c.name });
+  let n = 0;
+  for (const i of c.items) {
+    const d = await idb.get(`dossier:${c.id}:${i.seedKey}`);
+    if (!d) continue;
+    await teamApi('PUT', `cases/${encodeURIComponent(s.id)}/items/${encodeURIComponent(i.seedKey)}`, { meta: { chain: i.chain, addr: i.addr, role: i.role, pattern: i.pattern, title: i.title, size: i.size }, dossier: d });
+    await idb.set(`dossier:${teamCaseId(s.id)}:${i.seedKey}`, d).catch(() => {});
+    n++;
+  }
+  const wasCurrent = cases.currentId() === c.id;
+  for (const i of c.items) idb.del(`dossier:${c.id}:${i.seedKey}`).catch(() => {});
+  cases.save(cases.list().filter(x => x.id !== c.id));
+  await teamSync();
+  if (wasCurrent) cases.setCurrent(teamCaseId(s.id));
+  caseSel = teamCaseId(s.id);
+  renderCaseBar(); renderCases();
+  return n;
+}
+// Periodiek kijken of teamgenoten iets hebben gewijzigd.
+let teamPolledAt = 0, teamLabelsAt = 0, teamPollBusy = false;
+async function teamPoll() {
+  if (!team.on() || teamPollBusy || document.hidden) return;
+  teamPollBusy = true;
+  try {
+    const ch = await teamApi('GET', 'changes?since=' + teamPolledAt);
+    if (ch.cases.length) {
+      await teamSync();
+      if (teamLoaded && current && !current.merged) {
+        const c = caseById(teamLoaded.caseId);
+        const it = c?.items.find(i => i.seedKey === teamLoaded.seedKey);
+        if (it && it.by && it.by !== team.me() && it.saved > teamLoaded.at && current.seedKey === it.seedKey) {
+          teamLoaded.at = it.saved;
+          showTeamNotice(`${it.by} heeft dit onderzoek bijgewerkt.`, () => openCaseItem(c.id, it.seedKey));
+        }
+      }
+      if ($('#caseDlg').open && caseSel?.startsWith('t_')) renderTeamPanel(caseById(caseSel));
+    }
+    if (ch.labelsUpdated > teamLabelsAt) { teamLabelsAt = ch.labelsUpdated; await teamLoadLabels(); }
+    teamPolledAt = ch.now - 1000;
+  } catch { /* stil: volgende keer opnieuw */ }
+  teamPollBusy = false;
+}
+function showTeamNotice(text, onReload) {
+  const b = $('#teamNotice');
+  $('#teamNoticeText').textContent = text;
+  b.hidden = false;
+  $('#teamNoticeReload').onclick = () => { b.hidden = true; onReload(); };
+  $('#teamNoticeClose').onclick = () => { b.hidden = true; };
+}
+const teamLink = (kind, tok) => `${team.base()}/#${kind}=${tok}`;
+const ROLE_NAME = { owner: 'eigenaar', edit: 'mag bewerken', view: 'mag alleen kijken' };
+const ACT_TXT = { create: 'zaak aangemaakt', rename: 'naam gewijzigd', add: 'onderzoek toegevoegd', update: 'onderzoek bijgewerkt', remove: 'onderzoek verwijderd',
+  member: 'lid toegevoegd', 'member-removed': 'lid verwijderd', link: 'deellink gemaakt', 'link-revoked': 'deellink ingetrokken', comment: 'opmerking', join: 'doet mee via deellink' };
+const when = t => new Date(t).toLocaleString(window.CT_LOCALE, { dateStyle: 'short', timeStyle: 'short' });
+async function renderTeamPanel(c) {
+  const box = $('#caseTeam');
+  if (!c) { box.hidden = true; return; }
+  box.hidden = false;
+  if (!c.team) {
+    box.innerHTML = team.on()
+      ? `<p class="small muted">Deze zaak staat alleen op dit apparaat.</p><button type="button" class="ghost wide" data-team="upload">☁ Delen met mijn team (naar teamserver)</button>`
+      : `<p class="small muted">Samenwerken? Koppel de app aan een ChainTrace-teamserver om zaken te delen met collega's.</p><button type="button" class="ghost wide" data-team="connect">☁ Teamserver koppelen</button>`;
+    return;
+  }
+  if (!team.on() || c.team.srv !== team.base()) { box.innerHTML = `<p class="small muted">Teamzaak op ${esc(c.team.srv)}. Log in op die teamserver om mee te werken.</p><button type="button" class="ghost wide" data-team="connect">☁ Inloggen</button>`; return; }
+  const owner = c.team.role === 'owner', canEdit = c.team.role !== 'view';
+  box.innerHTML = `<p class="small muted">☁ Teamzaak · jij ${esc(ROLE_NAME[c.team.role] || c.team.role)} · eigenaar ${esc(c.team.owner || '?')}</p><div class="muted small">Laden…</div>`;
+  let com = [], act = [], links = [];
+  try {
+    const sid = encodeURIComponent(c.team.id);
+    [com, act, links] = await Promise.all([
+      teamApi('GET', `cases/${sid}/comments`).then(r => r.comments),
+      teamApi('GET', `cases/${sid}/activity`).then(r => r.activity),
+      owner ? teamApi('GET', `cases/${sid}/links`).then(r => r.links) : []
+    ]);
+  } catch (e) { box.innerHTML = `<p class="small err">${esc(e.message)}</p>`; return; }
+  if (caseSel !== c.id) return;
+  box.innerHTML = `<h4>Wie werkt mee?</h4>
+    <div class="team-members">${(c.team.members || []).map(m => `<span class="chip">${esc(m.username)} <small>${esc(ROLE_NAME[m.role] || m.role)}</small>${owner && m.role !== 'owner' ? `<button type="button" class="chip-x" data-team="kick" data-user="${esc(m.username)}" aria-label="Verwijderen">×</button>` : ''}</span>`).join('')}</div>
+    ${owner ? `<div class="team-row"><input id="teamAddName" type="text" placeholder="gebruikersnaam collega" autocomplete="off" spellcheck="false"><select id="teamAddRole"><option value="edit">mag bewerken</option><option value="view">mag alleen kijken</option></select><button type="button" class="ghost" data-team="add">Toevoegen</button></div>
+    <h4>Delen via een link</h4>
+    <div class="lbtns"><button type="button" class="ghost" data-team="link-view">🔗 Link: alleen kijken (zonder account)</button><button type="button" class="ghost" data-team="link-edit">🔗 Link: meewerken (met account)</button></div>
+    ${links.length ? `<div class="small muted team-links">${links.map(l => `<div>${l.role === 'view' ? 'Alleen kijken' : 'Meewerken'} · ${esc(l.hint || '')} · ${when(l.created)} <button type="button" class="linkbtn" data-team="revoke" data-link="${esc(l.id)}">intrekken</button></div>`).join('')}</div>` : ''}` : ''}
+    <h4>Opmerkingen</h4>
+    <div class="team-comments">${com.map(x => `<div class="team-comment"><b>${esc(x.by || '?')}</b> <small class="muted">${when(x.created)}</small><div>${esc(x.text)}</div></div>`).join('') || '<p class="small muted">Nog geen opmerkingen.</p>'}</div>
+    ${canEdit ? `<div class="team-row"><input id="teamComment" type="text" placeholder="Opmerking voor het team…"><button type="button" class="ghost" data-team="comment">Plaatsen</button></div>` : ''}
+    <details class="team-act"><summary>Activiteit</summary>${act.slice(0, 30).map(a => `<div class="small">${when(a.created)} · <b>${esc(a.by || '?')}</b> ${esc(ACT_TXT[a.action] || a.action)}${a.detail ? ': ' + esc(a.detail) : ''}</div>`).join('')}</details>`;
+}
+async function teamPanelClick(ev) {
+  const b = ev.target.closest('[data-team]');
+  if (!b) return;
+  const c = caseById(caseSel);
+  const sid = c?.team && encodeURIComponent(c.team.id);
+  try {
+    switch (b.dataset.team) {
+      case 'connect': openTeam(); return;
+      case 'upload': {
+        if (!confirm(`Zaak "${c.name}" naar de teamserver brengen? Daarna kun je collega's toevoegen en via een link delen.`)) return;
+        b.disabled = true; b.textContent = 'Bezig…';
+        const n = await teamUpload(c);
+        setStatus(`Zaak gedeeld: ${n} onderzoek(en) staan nu op de teamserver.`);
+        return;
+      }
+      case 'add': {
+        const u = $('#teamAddName').value.trim();
+        if (!u) return;
+        await teamApi('POST', `cases/${sid}/members`, { username: u, role: $('#teamAddRole').value });
+        await teamSync(); break;
+      }
+      case 'kick':
+        if (!confirm(`${b.dataset.user} uit deze zaak verwijderen?`)) return;
+        await teamApi('DELETE', `cases/${sid}/members/${encodeURIComponent(b.dataset.user)}`);
+        await teamSync(); break;
+      case 'link-view': case 'link-edit': {
+        const role = b.dataset.team === 'link-view' ? 'view' : 'edit';
+        const { token } = await teamApi('POST', `cases/${sid}/links`, { role });
+        const url = teamLink(role === 'view' ? 'view' : 'join', token);
+        const text = role === 'view' ? `Bekijk zaak "${c.name}" in ChainTrace (alleen kijken): ${url}` : `Werk mee aan zaak "${c.name}" in ChainTrace: ${url}`;
+        if (window.AndroidBridge?.shareText) window.AndroidBridge.shareText(text);
+        else if (navigator.share && isMobile()) navigator.share({ text }).catch(() => copyPlain(url));
+        else await copyPlain(url);
+        setStatus(role === 'view' ? 'Link gekopieerd: iedereen met deze link kan de zaak bekijken.' : 'Link gekopieerd: collega\'s met een account doen mee na inloggen.');
+        break;
+      }
+      case 'revoke':
+        await teamApi('DELETE', `cases/${sid}/links/${encodeURIComponent(b.dataset.link)}`); break;
+      case 'comment': {
+        const t = $('#teamComment').value.trim();
+        if (!t) return;
+        await teamApi('POST', `cases/${sid}/comments`, { text: t, seedKey: current?.seedKey || null }); break;
+      }
+    }
+    renderTeamPanel(caseById(caseSel));
+  } catch (e) { setStatus(e.message, true); alert(e.message); renderTeamPanel(caseById(caseSel)); }
+}
+
+// --- teamdialoog: koppelen, inloggen, beheer ---
+function renderTeamState() {
+  const on = team.on(), cfg = team.cfg();
+  $('#teamUrl').value = cfg.url || (teamSameOrigin ? location.origin : '');
+  $('#teamUrlBox').hidden = teamSameOrigin && !cfg.url;
+  $('#teamLoginBox').hidden = on;
+  $('#teamInBox').hidden = !on;
+  $('#teamWho').textContent = on ? `${cfg.username} @ ${team.base().replace(/^https?:\/\//, '')}` : '';
+  $('#teamAdminBox').hidden = !(on && cfg.admin);
+  $('#btnTeam').textContent = on ? `☁ Team: ${cfg.username}` : '☁ Team';
+  setTeamSync('');
+}
+async function openTeam() {
+  renderTeamState();
+  $('#teamMsg').textContent = '';
+  $('#teamSetupBox').hidden = true;
+  $('#teamDlg').showModal();
+  if (!team.on() && team.base()) teamCheckSetup(team.base());
+}
+async function teamCheckSetup(base) {
+  try {
+    const info = await teamApi('GET', 'info', undefined, { auth: false, base });
+    if (info.server !== 'chaintrace') throw new Error('Dit is geen ChainTrace-teamserver.');
+    $('#teamSetupBox').hidden = !info.setupNeeded;
+    return info;
+  } catch (e) { $('#teamMsg').textContent = e.message; return null; }
+}
+function teamUrlInput() {
+  let u = $('#teamUrl').value.trim().replace(/\/+$/, '');
+  if (!u && teamSameOrigin) return location.origin;
+  if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+  return u;
+}
+async function teamLogin(setup = false) {
+  const base = teamUrlInput();
+  const msg = $('#teamMsg');
+  if (!base) { msg.textContent = 'Vul het adres van de teamserver in.'; return; }
+  if (location.protocol === 'https:' && /^http:/i.test(base) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(base)) { msg.textContent = 'Deze app kan alleen met een https://-teamserver verbinden.'; return; }
+  const username = $('#teamUser').value.trim(), password = $('#teamPass').value;
+  msg.textContent = 'Bezig…';
+  try {
+    const body = { username, password };
+    if (setup) body.code = $('#teamCode').value.trim();
+    const r = await teamApi('POST', setup ? 'setup' : 'login', body, { auth: false, base });
+    team.setCfg({ url: base === location.origin && teamSameOrigin ? '' : base, token: r.token, username: r.username, admin: r.admin });
+    $('#teamPass').value = ''; $('#teamCode').value = '';
+    msg.textContent = '';
+    renderTeamState();
+    await teamSync(); await teamLoadLabels();
+    teamPolledAt = Date.now();
+    setStatus(`Ingelogd op de teamserver als ${r.username}.`);
+    if (teamPendingJoin) { const t = teamPendingJoin; teamPendingJoin = null; await teamJoin(t); }
+    else $('#teamDlg').close();
+  } catch (e) { msg.textContent = e.message; }
+}
+async function teamLogout() {
+  try { await teamApi('POST', 'logout'); } catch { /* lokaal toch uitloggen */ }
+  const c = team.cfg(); delete c.token; delete c.admin; team.setCfg(c);
+  teamLabels = {};
+  // teamzaken blijven niet op het apparaat staan na uitloggen
+  const keep = cases.list().filter(x => !x.team);
+  for (const x of cases.list().filter(x => x.team)) for (const i of x.items) idb.del(`dossier:${x.id}:${i.seedKey}`).catch(() => {});
+  cases.save(keep);
+  if (!caseById(cases.currentId())) cases.setCurrent(null);
+  renderCaseBar(); renderTeamState();
+  setStatus('Uitgelogd van de teamserver.');
+}
+let teamPendingJoin = null;
+async function teamJoin(token) {
+  if (!team.on()) { teamPendingJoin = token; openTeam(); $('#teamMsg').textContent = 'Log in om mee te werken aan de gedeelde zaak.'; return; }
+  try {
+    const { caseId } = await teamApi('POST', 'join', { token });
+    await teamSync();
+    $('#teamDlg').close();
+    caseSel = teamCaseId(caseId);
+    cases.setCurrent(caseSel); renderCaseBar();
+    renderCases(); $('#caseDlg').showModal();
+    setStatus('Je werkt nu mee aan deze zaak.');
+  } catch (e) { setStatus(e.message, true); alert(e.message); }
+}
+// Alleen-kijken-link: zonder account de onderzoeken van de zaak samen in één web openen.
+async function teamView(token) {
+  try {
+    const base = team.base() || location.origin;
+    const { case: c } = await teamApi('GET', 'shared/' + encodeURIComponent(token), undefined, { auth: false, base });
+    const ds = [];
+    for (const i of c.items) { try { ds.push((await teamApi('GET', `shared/${encodeURIComponent(token)}/items/${encodeURIComponent(i.seedKey)}`, undefined, { auth: false, base })).dossier); } catch { /* overslaan */ } }
+    if (!ds.length) { setStatus(`Gedeelde zaak "${c.name}" bevat nog geen onderzoeken.`); return; }
+    importJson(ds[0]);
+    for (const d of ds.slice(1)) importJson(d, { merge: true });
+    current.merged = true; current.readOnly = true;
+    $('#formBox').open = false;
+    render(true); renderSummary(); refreshView();
+    setStatus(`Gedeelde zaak "${c.name}" (alleen kijken): ${ds.length} onderzoek(en), ${nodes.size} adressen.`);
+    if (isMobile()) setTab('graph');
+  } catch (e) { setStatus(e.message, true); }
+}
+function teamHash() {
+  const m = location.hash.match(/^#(join|view)=([A-Za-z0-9_-]{16,})$/);
+  if (!m) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  if (m[1] === 'view') teamView(m[2]); else teamJoin(m[2]);
+}
+async function setupTeam() {
+  $('#btnTeam').addEventListener('click', openTeam);
+  $('#teamClose').addEventListener('click', () => $('#teamDlg').close());
+  $('#teamLogin').addEventListener('click', () => teamLogin(false));
+  $('#teamSetup').addEventListener('click', () => teamLogin(true));
+  $('#teamPass').addEventListener('keydown', ev => { if (ev.key === 'Enter') teamLogin(!$('#teamSetupBox').hidden); });
+  $('#teamUrl').addEventListener('change', () => { const b = teamUrlInput(); if (b) teamCheckSetup(b); });
+  $('#teamLogout').addEventListener('click', teamLogout);
+  $('#teamSyncNow').addEventListener('click', async () => { try { await teamSync(); await teamLoadLabels(); $('#teamMsg').textContent = 'Bijgewerkt.'; } catch (e) { $('#teamMsg').textContent = e.message; } });
+  $('#teamAddUser').addEventListener('click', async () => {
+    try {
+      await teamApi('POST', 'users', { username: $('#teamNewUser').value.trim(), password: $('#teamNewPass').value, admin: $('#teamNewAdmin').checked });
+      $('#teamMsg').textContent = `Account ${$('#teamNewUser').value.trim()} aangemaakt. Geef de gebruikersnaam en het wachtwoord door aan je collega.`;
+      $('#teamNewUser').value = ''; $('#teamNewPass').value = ''; $('#teamNewAdmin').checked = false;
+    } catch (e) { $('#teamMsg').textContent = e.message; }
+  });
+  $('#teamPwChange').addEventListener('click', async () => {
+    const old = prompt('Huidig wachtwoord:'); if (!old) return;
+    const nw = prompt('Nieuw wachtwoord (minstens 8 tekens):'); if (!nw) return;
+    try { const r = await teamApi('POST', 'me/password', { old, new: nw }); team.setCfg({ ...team.cfg(), token: r.token }); $('#teamMsg').textContent = 'Wachtwoord gewijzigd.'; }
+    catch (e) { $('#teamMsg').textContent = e.message; }
+  });
+  $('#caseTeam').addEventListener('click', teamPanelClick);
+  $('#caseTeam').addEventListener('keydown', ev => { if (ev.key === 'Enter' && ev.target.id === 'teamComment') teamPanelClick({ target: $('[data-team="comment"]') }); });
+  window.addEventListener('hashchange', teamHash);
+  // Webversie die door de teamserver zelf wordt geleverd: automatisch herkennen.
+  if (/^https?:$/.test(location.protocol) && location.hostname !== 'appassets.androidplatform.net') {
+    try {
+      const r = await fetch('api/info', { cache: 'no-store' });
+      const j = r.ok && (r.headers.get('content-type') || '').includes('json') ? await r.json() : null;
+      teamSameOrigin = j?.server === 'chaintrace';
+    } catch { /* gewone statische host */ }
+  }
+  $('#btnTeam').hidden = false;
+  renderTeamState();
+  teamHash();
+  if (team.on()) {
+    teamPolledAt = Date.now();
+    teamSync().catch(() => {}); teamLoadLabels();
+  }
+  setInterval(teamPoll, 20000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) teamPoll(); });
+}
+
 function newCase(name) {
   const c = { id: 'c' + Date.now().toString(36), name: name || `Zaak van ${new Date().toLocaleDateString(window.CT_LOCALE, { day: 'numeric', month: 'long', year: 'numeric' })}`, created: Date.now(), items: [] };
   cases.save([c, ...cases.list()]);
@@ -3014,25 +3406,30 @@ let saveTimer = null;
 function autosave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
-    if (!current || demoMode || current.merged || !nodes.size) return;
+    if (!current || demoMode || current.merged || current.readOnly || !nodes.size) return;
     const seed = nodes.get(current.seedKey);
     if (!seed || isDemoAddr(seed.addr)) return;
-    let c = caseById(cases.currentId()) || newCase();
+    let c = caseById(cases.currentId());
+    if (c && !team.canEdit(c)) c = null; // alleen-kijken-teamzaak: in een eigen zaak bewaren
+    c = c || newCase();
     const item = { seedKey: current.seedKey, chain: current.chain, addr: seed.addr, role: current.role, pattern: window.PATTERNS[current.pattern].name,
       title: labelOf(seed) || short(seed.addr), saved: Date.now(), size: nodes.size };
-    try { await idb.set(`dossier:${c.id}:${current.seedKey}`, buildDossier()); } catch { return; }
+    const dossier = buildDossier();
+    try { await idb.set(`dossier:${c.id}:${current.seedKey}`, dossier); } catch { return; }
     const list = cases.list();
     c = list.find(x => x.id === c.id);
     c.items = [item, ...c.items.filter(i => i.seedKey !== item.seedKey)];
     c.updated = Date.now();
     cases.save(list);
     renderCaseBar();
+    if (c.team) teamPushItem(c, item, dossier);
   }, 1500);
 }
 function renderCaseBar() {
   const c = caseById(cases.currentId());
   $('#caseName').textContent = c ? c.name : 'nog geen zaak';
   $('#caseCount').textContent = c ? `${c.items.length} onderzoek${c.items.length === 1 ? '' : 'en'}` : '';
+  setTeamSync(c?.team ? 'ok' : '');
 }
 let caseSel = null;
 function renderCases() {
@@ -3040,25 +3437,34 @@ function renderCases() {
   if (!caseSel || !list.some(c => c.id === caseSel)) caseSel = cases.currentId() || list[0]?.id || null;
   const c = list.find(x => x.id === caseSel);
   $('#caseList').innerHTML = list.map(x => `<button type="button" class="case-item ${x.id === caseSel ? 'active' : ''}" data-case="${x.id}">
-      <b>${esc(x.name)}</b><small>${x.items.length} onderzoek${x.items.length === 1 ? '' : 'en'} · ${new Date(x.updated || x.created).toLocaleDateString(window.CT_LOCALE)}${x.id === cases.currentId() ? ' · <em>huidige zaak</em>' : ''}</small></button>`).join('')
+      <b>${x.team ? '☁ ' : ''}${esc(x.name)}</b><small>${x.items.length} onderzoek${x.items.length === 1 ? '' : 'en'} · ${new Date(x.updated || x.created).toLocaleDateString(window.CT_LOCALE)}${x.id === cases.currentId() ? ' · <em>huidige zaak</em>' : ''}</small></button>`).join('')
     || '<p class="muted">Nog geen zaken. Een onderzoek wordt automatisch bewaard zodra het klaar is.</p>';
   $('#caseDetail').hidden = !c;
   if (!c) return;
   $('#caseTitle').textContent = c.name;
   $('#caseItems').innerHTML = c.items.map(i => `<div class="xrow"><div class="xrow-top"><i class="dot ${i.role === 'perp' ? 'perp' : 'victim'}"></i><b>${esc(i.title)}</b><span class="muted small">${esc(CHAIN_NAME[i.chain] || i.chain)}</span></div>
-      <div class="xrow-sub muted">${i.role === 'perp' ? 'Dader' : 'Slachtoffer'} · ${esc(i.pattern)} · ${i.size} adressen · bewaard ${new Date(i.saved).toLocaleString(window.CT_LOCALE, { dateStyle: 'short', timeStyle: 'short' })}</div>
-      <div class="lbtns"><button type="button" class="ghost" data-open="${esc(i.seedKey)}">Openen</button><button type="button" class="ghost" data-del="${esc(i.seedKey)}">Verwijderen</button></div></div>`).join('')
+      <div class="xrow-sub muted">${i.role === 'perp' ? 'Dader' : 'Slachtoffer'} · ${esc(i.pattern)} · ${i.size} adressen · bewaard ${new Date(i.saved).toLocaleString(window.CT_LOCALE, { dateStyle: 'short', timeStyle: 'short' })}${i.by ? ` door ${esc(i.by)}` : ''}</div>
+      <div class="lbtns"><button type="button" class="ghost" data-open="${esc(i.seedKey)}">Openen</button>${team.canEdit(c) ? `<button type="button" class="ghost" data-del="${esc(i.seedKey)}">Verwijderen</button>` : ''}</div></div>`).join('')
     || '<p class="muted">Deze zaak heeft nog geen onderzoeken. Start een onderzoek: het wordt hier automatisch bewaard.</p>';
   $('#caseMerge').disabled = c.items.length < 2;
+  $('#caseRename').hidden = !team.canEdit(c);
+  $('#caseUse').hidden = !team.canEdit(c);
+  $('#caseDelete').hidden = !!c.team && c.team.role !== 'owner';
+  renderTeamPanel(c);
+}
+// Dossier van een onderzoek: lokaal, of van de teamserver.
+async function caseDossier(c, seedKey) {
+  if (c?.team && team.on() && c.team.srv === team.base()) { try { return await teamOpenItem(c, seedKey); } catch (e) { setStatus(e.message, true); } }
+  return idb.get(`dossier:${c?.id}:${seedKey}`);
 }
 async function openCaseItem(caseId, seedKey, merge = false) {
-  const d = await idb.get(`dossier:${caseId}:${seedKey}`);
+  const d = await caseDossier(caseById(caseId), seedKey);
   if (!d) { setStatus('Dit onderzoek kon niet worden geladen.', true); return; }
   importJson(d, { merge });
 }
 async function mergeCase(c) {
   const ds = [];
-  for (const i of c.items) { const d = await idb.get(`dossier:${c.id}:${i.seedKey}`); if (d) ds.push(d); }
+  for (const i of c.items) { const d = await caseDossier(c, i.seedKey); if (d) ds.push(d); }
   if (!ds.length) return;
   importJson(ds[0]);
   for (const d of ds.slice(1)) importJson(d, { merge: true });
@@ -3331,6 +3737,7 @@ function setupFeatures() {
     if (o) { cases.setCurrent(caseSel); renderCaseBar(); dlg.close(); await openCaseItem(caseSel, o.dataset.open); if (isMobile()) setTab('graph'); }
     if (d && confirm('Dit onderzoek uit de zaak verwijderen?')) {
       const l = cases.list(); const c = l.find(x => x.id === caseSel);
+      if (c.team) { try { await teamApi('DELETE', `cases/${encodeURIComponent(c.team.id)}/items/${encodeURIComponent(d.dataset.del)}`); } catch (e) { alert(e.message); return; } }
       c.items = c.items.filter(i => i.seedKey !== d.dataset.del);
       cases.save(l); idb.del(`dossier:${caseSel}:${d.dataset.del}`).catch(() => {});
       renderCases(); renderCaseBar();
@@ -3344,16 +3751,18 @@ function setupFeatures() {
     setStatus('Nieuwe onderzoeken worden nu in deze zaak bewaard.');
   });
   $('#caseUse').addEventListener('click', () => { cases.setCurrent(caseSel); renderCaseBar(); renderCases(); setStatus('Nieuwe onderzoeken worden nu in deze zaak bewaard.'); });
-  $('#caseRename').addEventListener('click', () => {
+  $('#caseRename').addEventListener('click', async () => {
     const l = cases.list(); const c = l.find(x => x.id === caseSel); if (!c) return;
     const name = prompt('Nieuwe naam:', c.name);
     if (!name?.trim()) return;
+    if (c.team) { try { await teamApi('PATCH', `cases/${encodeURIComponent(c.team.id)}`, { name: name.trim() }); } catch (e) { alert(e.message); return; } }
     c.name = name.trim(); cases.save(l); renderCases(); renderCaseBar();
   });
   $('#caseMerge').addEventListener('click', async () => { const c = caseById(caseSel); if (!c) return; dlg.close(); await mergeCase(c); });
-  $('#caseDelete').addEventListener('click', () => {
+  $('#caseDelete').addEventListener('click', async () => {
     const c = caseById(caseSel); if (!c) return;
-    if (!confirm(`Zaak "${c.name}" met ${c.items.length} onderzoek(en) verwijderen? Dit kan niet ongedaan worden gemaakt.`)) return;
+    if (!confirm(c.team ? `Teamzaak "${c.name}" voor het hele team verwijderen? Dit kan niet ongedaan worden gemaakt.` : `Zaak "${c.name}" met ${c.items.length} onderzoek(en) verwijderen? Dit kan niet ongedaan worden gemaakt.`)) return;
+    if (c.team) { try { await teamApi('DELETE', `cases/${encodeURIComponent(c.team.id)}`); } catch (e) { alert(e.message); return; } }
     for (const i of c.items) idb.del(`dossier:${c.id}:${i.seedKey}`).catch(() => {});
     cases.save(cases.list().filter(x => x.id !== c.id));
     if (cases.currentId() === c.id) cases.setCurrent(null);
@@ -3647,15 +4056,16 @@ function contactHtml(c) {
 // ---------- back-up van zaken ----------
 async function exportCase(c) {
   const dossiers = {};
-  for (const i of c.items) { const d = await idb.get(`dossier:${c.id}:${i.seedKey}`); if (d) dossiers[i.seedKey] = d; }
-  const data = { tool: 'ChainTrace', kind: 'case', version: 1, exported: new Date().toISOString(), case: c, dossiers };
+  for (const i of c.items) { const d = await caseDossier(c, i.seedKey); if (d) dossiers[i.seedKey] = d; }
+  const { team: _t, ...plain } = c;
+  const data = { tool: 'ChainTrace', kind: 'case', version: 1, exported: new Date().toISOString(), case: plain, dossiers };
   saveFile(`chaintrace-zaak-${c.name.replace(/[^\w-]+/g, '_').slice(0, 40)}-${stamp()}.json`, 'application/json', JSON.stringify(data), false);
 }
 async function importCaseFile(text) {
   const d = JSON.parse(text);
   if (d.tool !== 'ChainTrace') throw new Error('Geen ChainTrace-bestand');
   if (d.kind === 'case') {
-    const c = { ...d.case, id: 'c' + Date.now().toString(36), name: d.case.name + (caseById(d.case.id) ? ' (import)' : ''), items: [] };
+    const c = { ...d.case, team: undefined, id: 'c' + Date.now().toString(36), name: d.case.name + (caseById(d.case.id) ? ' (import)' : ''), items: [] };
     for (const i of d.case.items || []) {
       const dos = d.dossiers?.[i.seedKey];
       if (!dos) continue;
@@ -3673,6 +4083,7 @@ async function importCaseFile(text) {
   const list = cases.list(); const cc = list.find(x => x.id === c.id);
   cc.items = [{ seedKey: seed.key, chain: seed.chain, addr: seed.address, role: d.case?.role || 'victim', pattern: d.case?.pattern || '', title: seed.label || short(seed.address), saved: Date.now(), size: d.nodes.length }, ...cc.items.filter(i => i.seedKey !== seed.key)];
   cases.save(list);
+  if (cc.team) teamPushItem(cc, cc.items[0], d);
   return `Dossier toegevoegd aan zaak "${cc.name}".`;
 }
 
@@ -3695,7 +4106,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '2.3';
+const APP_VERSION = '3.0';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -4151,5 +4562,5 @@ function setupV22() {
 
 setup();
 // Testhaak voor automatische checks (bijv. via adb/DevTools).
-window.ChainTrace = { taintAnalysis, eurOf, ensurePrices, resolveBridge, swapsOf, followWallet, toggleWalletWatch, renderOverview, evidenceDossier, sha256Hex, tronHexToB58, routeEdgeKeys, get cy() { return cy; }, walletSummary, clusterOf, labelOf, idb, importCaseFile, cyWallets: () => cy ? cy.nodes('[?wallet]').length : 0, extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
+window.ChainTrace = { team, teamApi, teamSync, buildDossier, taintAnalysis, eurOf, ensurePrices, resolveBridge, swapsOf, followWallet, toggleWalletWatch, renderOverview, evidenceDossier, sha256Hex, tronHexToB58, routeEdgeKeys, get cy() { return cy; }, walletSummary, clusterOf, labelOf, idb, importCaseFile, cyWallets: () => cy ? cy.nodes('[?wallet]').length : 0, extract: extractFromText, runTour, stopTour, startDemo, checkWatches, watch, cases, DEMO, openLetter, moneyRoutes, openAddr, openTx, nav, ghosts, runTrace, nodes, edges, detectChain, origins, traceOrigins, composeReport, exportPdf, summaryLines, notes: () => notes };
 })();

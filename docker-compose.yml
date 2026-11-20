@@ -1,0 +1,42 @@
+# ChainTrace teamserver
+#   docker compose up -d                      -> http://<server>:8080
+#   docker compose --profile https up -d      -> https://$CT_DOMAIN (Caddy, automatisch certificaat)
+# De setup-code voor de eerste beheerder staat in: docker compose logs chaintrace
+services:
+  chaintrace:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: chaintrace-server:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Optioneel: beheerder direct aanmaken in plaats van via de setup-code
+      # CT_ADMIN_USER: admin
+      # CT_ADMIN_PASSWORD: kies-een-sterk-wachtwoord
+      # Extra origins die de API mogen gebruiken (de Android-app staat er standaard in)
+      CT_CORS_ORIGINS: ""
+      # Zet op "1" als de server alleen via de Caddy-proxy bereikbaar is
+      CT_TRUST_PROXY: "0"
+    volumes:
+      - chaintrace-data:/data
+
+  caddy:
+    profiles: ["https"]
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CT_DOMAIN: ${CT_DOMAIN:-localhost}
+    command: caddy reverse-proxy --from ${CT_DOMAIN:-localhost} --to chaintrace:8080
+    volumes:
+      - caddy-data:/data
+    depends_on:
+      - chaintrace
+
+volumes:
+  chaintrace-data:
+  caddy-data:

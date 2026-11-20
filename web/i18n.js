@@ -450,6 +450,67 @@ patterns.push(
   ['- {0}', '- {0}'], ['{#0}. {1}', '{0}. {1}'], ['{#0}. {1}: {2}', '{0}. {1}: {2}']
 );
 Object.assign(exact, PDF_EXTRA);
+// --- teamserver (samenwerken) ---
+const TEAM_ACT = { 'zaak aangemaakt': 'case created', 'naam gewijzigd': 'renamed', 'onderzoek toegevoegd': 'investigation added', 'onderzoek bijgewerkt': 'investigation updated',
+  'onderzoek verwijderd': 'investigation removed', 'lid toegevoegd': 'member added', 'lid verwijderd': 'member removed', 'deellink gemaakt': 'share link created',
+  'deellink ingetrokken': 'share link revoked', 'opmerking': 'comment', 'doet mee via deellink': 'joined via share link' };
+Object.assign(exact, TEAM_ACT, {
+  '☁ Team': '☁ Team', '☁ Samenwerken': '☁ Collaborate', 'Nieuwe versie openen': 'Open new version',
+  'Met een ChainTrace-teamserver (eigen server in een Docker-container) deel je zaken met collega\'s: samen aan één zaak werken, opmerkingen, gedeelde labels en een link om een zaak te laten bekijken. Zonder teamserver werkt de app gewoon zelfstandig.':
+    'With a ChainTrace team server (your own server in a Docker container) you share cases with colleagues: work on one case together, comments, shared labels and a link to let someone view a case. Without a team server the app simply works stand-alone.',
+  'Adres van de teamserver': 'Team server address', 'Gebruikersnaam': 'Username', 'Wachtwoord': 'Password', 'Inloggen': 'Log in', 'Uitloggen': 'Log out',
+  'Nieuwe server.': 'New server.', 'Maak het eerste beheerdersaccount aan met de setup-code uit de serverlog (': 'Create the first administrator account with the setup code from the server log (',
+  'Setup-code': 'Setup code', 'Beheerder aanmaken': 'Create administrator', 'Ingelogd als': 'Logged in as',
+  'Open': 'Open', 'om een zaak te delen of mee te werken. Teamzaken hebben een ☁ en worden automatisch bijgewerkt.': 'to share a case or collaborate. Team cases have a ☁ and are updated automatically.',
+  'Nu bijwerken': 'Refresh now', 'Wachtwoord wijzigen': 'Change password', 'Collega toevoegen (beheerder)': 'Add colleague (administrator)',
+  'Wachtwoord (minstens 8 tekens)': 'Password (at least 8 characters)', 'Ook beheerder': 'Also administrator', 'Account aanmaken': 'Create account',
+  'Elk onderzoek wordt automatisch bewaard in de huidige zaak, op dit apparaat (of op de teamserver bij een ☁ teamzaak). Zet meerdere onderzoeken samen in één web om verbanden te zien, zoals dezelfde oplichter bij verschillende slachtoffers.':
+    'Every investigation is saved automatically in the current case, on this device (or on the team server for a ☁ team case). Combine several investigations in one graph to see connections, such as the same scammer with different victims.',
+  'Deze zaak staat alleen op dit apparaat.': 'This case is only on this device.', '☁ Delen met mijn team (naar teamserver)': '☁ Share with my team (to team server)',
+  'Samenwerken? Koppel de app aan een ChainTrace-teamserver om zaken te delen met collega\'s.': 'Collaborating? Connect the app to a ChainTrace team server to share cases with colleagues.',
+  '☁ Teamserver koppelen': '☁ Connect team server', '☁ Inloggen': '☁ Log in', 'Laden…': 'Loading…', 'Wie werkt mee?': 'Who is collaborating?',
+  'gebruikersnaam collega': 'colleague\'s username', 'mag bewerken': 'can edit', 'mag alleen kijken': 'can only view', 'eigenaar': 'owner', 'Toevoegen': 'Add',
+  'Delen via een link': 'Share via a link', '🔗 Link: alleen kijken (zonder account)': '🔗 Link: view only (no account)', '🔗 Link: meewerken (met account)': '🔗 Link: collaborate (with account)',
+  'Alleen kijken': 'View only', 'Meewerken': 'Collaborate', 'intrekken': 'revoke', 'Opmerkingen': 'Comments', 'Nog geen opmerkingen.': 'No comments yet.',
+  'Opmerking voor het team…': 'Comment for the team…', 'Plaatsen': 'Post', 'Activiteit': 'Activity', '☁ Teamzaak': '☁ Team case', '☁ gedeeld': '☁ shared', '⚠ niet gedeeld': '⚠ not shared',
+  'Opgeslagen op de teamserver': 'Saved on the team server', 'Bezig…': 'Working…', 'Bijgewerkt.': 'Updated.',
+  'Teamserver niet bereikbaar. Controleer het adres en de internetverbinding.': 'Team server unreachable. Check the address and the internet connection.',
+  'Vul het adres van de teamserver in.': 'Enter the team server address.', 'Deze app kan alleen met een https://-teamserver verbinden.': 'This app can only connect to an https:// team server.',
+  'Dit is geen ChainTrace-teamserver.': 'This is not a ChainTrace team server.', 'Uitgelogd van de teamserver.': 'Logged out of the team server.',
+  'Log in om mee te werken aan de gedeelde zaak.': 'Log in to collaborate on the shared case.', 'Je werkt nu mee aan deze zaak.': 'You are now collaborating on this case.',
+  'Huidig wachtwoord:': 'Current password:', 'Nieuw wachtwoord (minstens 8 tekens):': 'New password (at least 8 characters):', 'Wachtwoord gewijzigd.': 'Password changed.',
+  'Link gekopieerd: iedereen met deze link kan de zaak bekijken.': 'Link copied: anyone with this link can view the case.',
+  'Link gekopieerd: collega\'s met een account doen mee na inloggen.': 'Link copied: colleagues with an account join after logging in.',
+  // meldingen van de server
+  'Niet ingelogd': 'Not logged in', 'Geen toegang tot deze zaak': 'No access to this case', 'Alleen-lezen toegang': 'Read-only access', 'Zaak niet gevonden': 'Case not found',
+  'Onjuiste gebruikersnaam of wachtwoord': 'Incorrect username or password', 'Te veel pogingen, probeer het later opnieuw': 'Too many attempts, try again later',
+  'Onjuiste setup-code (zie de serverlog)': 'Incorrect setup code (see the server log)', 'De server is al ingericht': 'The server has already been set up',
+  'Gebruikersnaam 2-40 tekens, wachtwoord minstens 8 tekens': 'Username 2–40 characters, password at least 8 characters',
+  'Gebruikersnaam 2-40 tekens (letters, cijfers, . _ - @), wachtwoord minstens 8 tekens': 'Username 2–40 characters (letters, digits, . _ - @), password at least 8 characters',
+  'Gebruiker bestaat al': 'User already exists', 'Gebruiker niet gevonden': 'User not found', 'Alleen voor beheerders': 'Administrators only',
+  'Alleen de eigenaar beheert leden': 'Only the owner manages members', 'Alleen de eigenaar maakt deellinks': 'Only the owner creates share links',
+  'Alleen de eigenaar kan de zaak verwijderen': 'Only the owner can delete the case', 'Deellink ongeldig of ingetrokken': 'Share link invalid or revoked',
+  'Huidig wachtwoord klopt niet': 'Current password is incorrect', 'Nieuw wachtwoord minstens 8 tekens': 'New password at least 8 characters',
+  'De eigenaar heeft al volledige toegang': 'The owner already has full access', 'Onderzoek niet gevonden': 'Investigation not found', 'Lege opmerking': 'Empty comment', 'Intussen door iemand anders bijgewerkt': 'Updated by someone else in the meantime', 'een teamgenoot': 'a team member'
+});
+patterns.unshift(['bewaard {0} door {1}', 'saved {0} by {1}']);
+patterns.push(
+  ['☁ Team: {0}', '☁ Team: {0}'], ['jij {0}', 'you {0}'], ['eigenaar {0}', 'owner {0}'],
+  ['{0} heeft dit onderzoek bijgewerkt.', '{0} updated this investigation.'], ['Ingelogd op de teamserver als {0}.', 'Logged in to the team server as {0}.'],
+  ['Zaak gedeeld: {#0} onderzoek(en) staan nu op de teamserver.', 'Case shared: {0} investigation(s) are now on the team server.'],
+  ['Teamzaak op {0}. Log in op die teamserver om mee te werken.', 'Team case on {0}. Log in to that team server to collaborate.'],
+  ['Zaak "{0}" naar de teamserver brengen? Daarna kun je collega\'s toevoegen en via een link delen.', 'Move case "{0}" to the team server? You can then add colleagues and share via a link.'],
+  ['{0} uit deze zaak verwijderen?', 'Remove {0} from this case?'],
+  ['Teamzaak "{0}" voor het hele team verwijderen? Dit kan niet ongedaan worden gemaakt.', 'Delete team case "{0}" for the whole team? This cannot be undone.'],
+  ['Account {0} aangemaakt. Geef de gebruikersnaam en het wachtwoord door aan je collega.', 'Account {0} created. Pass the username and password on to your colleague.'],
+  ['Gedeelde zaak "{0}" (alleen kijken): {#1} onderzoek(en), {#2} adressen.', 'Shared case "{0}" (view only): {1} investigation(s), {2} addresses.'],
+  ['Gedeelde zaak "{0}" bevat nog geen onderzoeken.', 'Shared case "{0}" has no investigations yet.'],
+  ['Bekijk zaak "{0}" in ChainTrace (alleen kijken): {1}', 'View case "{0}" in ChainTrace (view only): {1}'], ['Werk mee aan zaak "{0}" in ChainTrace: {1}', 'Collaborate on case "{0}" in ChainTrace: {1}'],
+  ['Fout van de teamserver ({#0})', 'Team server error ({0})'],
+  ['Samengevoegd met de wijzigingen van {0}.', 'Merged with the changes made by {0}.'],
+  ...Object.entries(TEAM_ACT).map(([nl, en]) => [nl + ': {0}', en + ': {0}'])
+);
+
 
 // ----- motor -----
 const norm = s => s.replace(/\s+/g, ' ').trim();

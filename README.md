@@ -38,8 +38,13 @@ ChainTrace is gemaakt als **eerste-hulpgereedschap** voor slachtoffers, fraudehe
 - **Volgen**: een adres of hele wallet volgen en een melding krijgen zodra er weer geld beweegt (op Android ook als de app dicht is).
 - **Mijn zaken**: onderzoeken worden automatisch per zaak bewaard, kunnen samen in één web, en als back-upbestand worden bewaard.
 
+**Samenwerken (optioneel)**
+- **Teamserver** in een Docker-container: zaken delen met collega's, samen aan één zaak werken (gelijktijdige wijzigingen worden samengevoegd), opmerkingen, activiteitenlog en teamlabels.
+- **Deellink**: een zaak laten bekijken zonder account, of een collega laten meewerken. Zie [server/README.md](server/README.md).
+
 **Werkt overal**
 - Webversie (elke browser) en Android-app uit dezelfde code; geschikt voor telefoon (vanaf 6 inch), tablet en computer.
+- Zonder server volledig zelfstandig; mét teamserver gedeeld.
 - Nederlands en Engels.
 
 ---
@@ -53,6 +58,12 @@ ChainTrace is gemaakt als **eerste-hulpgereedschap** voor slachtoffers, fraudehe
 python -m http.server 8765 --directory web
 ```
 Open http://localhost:8765. De map `web/` is een statische site en kan op elke statische host (bijv. GitHub Pages).
+
+**Teamserver (samenwerken)**
+```bash
+docker compose up -d --build        # http://<server>:8080 — setup-code: docker compose logs chaintrace
+```
+Daarna in de app: *Meer → ☁ Team*. HTTPS, back-up en instellingen: [server/README.md](server/README.md).
 
 **Android zelf bouwen**
 ```bash
@@ -104,7 +115,9 @@ Alle regels die de app gebruikt — tijdsvolgorde, wallet-herkenning, stortingsa
 
 ## Privacy
 
-Er is geen server en geen account. Onderzoeken, notities, zaken en sleutels blijven op het apparaat. De app vraagt alleen openbare blockchaingegevens op bij de hierboven genoemde diensten.
+Zonder teamserver is er geen server en geen account: onderzoeken, notities, zaken en sleutels blijven op het apparaat. De app vraagt alleen openbare blockchaingegevens op bij de hierboven genoemde diensten.
+
+Met een teamserver staan de ☁ teamzaken (onderzoeken, opmerkingen, teamlabels) op die server, die jullie zelf beheren. Eigen zaken die je niet deelt blijven op het apparaat. Sleutels (Solana, TronGrid) gaan nooit naar de teamserver.
 
 ## Bijdragen
 
@@ -118,13 +131,14 @@ Meldingen en verbeteringen zijn welkom via Issues en Pull requests. Er is een ze
 
 ## English summary
 
-**ChainTrace** is a free, open-source blockchain investigation tool for people without a forensic-analytics licence: victims, fraud help desks, local police, lawyers and journalists. No account, no server — data stays on your device.
+**ChainTrace** is a free, open-source blockchain investigation tool for people without a forensic-analytics licence: victims, fraud help desks, local police, lawyers and journalists. No account, no server needed — data stays on your device unless you choose to use your own team server.
 
 Paste a victim's or perpetrator's address and ChainTrace will:
 - follow the money (time-ordered) across Bitcoin, Ethereum, Optimism, Avalanche, zkSync Era, Tron, Solana and Litecoin, including through DEX swaps and bridges (deBridge, Across, LayerZero/Stargate);
 - explain each address in plain language, detect customer deposit addresses at exchanges and cluster addresses of the same owner with transparent built-in rules;
 - estimate where the victim's money ended up, in euros at the time of payment (proportional/haircut method);
 - generate a freeze/preservation request letter to the exchange with its verified law-enforcement channel, and a PDF report with a verifiable evidence file (SHA-256);
-- watch addresses or whole wallets and notify you when funds move.
+- watch addresses or whole wallets and notify you when funds move;
+- optionally collaborate through a self-hosted **team server** (Docker): shared cases with roles, automatic merging of simultaneous edits, comments, activity log, team labels and view/join links ([server/README.md](server/README.md)).
 
 Web app (any browser) and Android app from one codebase; Dutch and English UI. Methods and limitations: [docs/METHODS.md](docs/METHODS.md). Results are indications, not proof.

@@ -8,3 +8,5 @@ local.properties
 captures/
 .claude/
 *.apk
+server/data/
+__pycache__/

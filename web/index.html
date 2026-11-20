@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#171e26">
 <title>ChainTrace</title>
-<link rel="stylesheet" href="style.css?v=2.3">
+<link rel="stylesheet" href="style.css?v=3.0">
 </head>
 <body>
 <header class="topbar">
@@ -31,6 +31,7 @@
         <button id="btnTour" type="button">▶ Rondleiding</button>
         <button id="btnCases" type="button">📁 Mijn zaken</button>
         <button id="btnWatch" type="button">🔔 Gevolgde adressen</button>
+        <button id="btnTeam" type="button" hidden>☁ Team</button>
         <button id="btnBig" type="button">Grote letters</button>
         <button id="btnGlossary" type="button">Woordenlijst (uitleg)</button>
         <button id="btnSettings" type="button">⚙ Instellingen</button>
@@ -42,8 +43,9 @@
 <main class="layout">
   <section class="panel form-panel">
     <div id="watchBanner" class="banner watchb" hidden><span>🔔 <b id="watchBannerText"></b></span><button type="button" id="watchBannerBtn" class="ghost">Bekijk</button></div>
+    <div id="teamNotice" class="banner teamb" hidden><span>☁ <b id="teamNoticeText"></b></span><button type="button" id="teamNoticeReload" class="ghost">Nieuwe versie openen</button><button type="button" id="teamNoticeClose" class="ghost" aria-label="Sluiten">×</button></div>
     <div id="demoBanner" class="banner demob" hidden><span>📘 Dit is een <b>voorbeeldzaak met verzonnen gegevens</b>.</span><button type="button" id="btnDemoStop" class="ghost">Stop voorbeeld</button></div>
-    <div id="caseBar" class="casebar"><span>📁 Zaak: <b id="caseName">nog geen zaak</b> <small id="caseCount" class="muted"></small></span><button type="button" id="btnCases2" class="ghost">Mijn zaken</button></div>
+    <div id="caseBar" class="casebar"><span>📁 Zaak: <b id="caseName">nog geen zaak</b> <small id="caseCount" class="muted"></small> <small id="teamSync" class="team-sync" hidden></small></span><button type="button" id="btnCases2" class="ghost">Mijn zaken</button></div>
     <details id="formBox" class="formbox" open>
     <summary><span id="formSummaryText">🔎 <b>Nieuw onderzoek</b></span><span id="formSummaryHint" class="fs-hint"></span></summary>
     <form id="traceForm" autocomplete="off">
@@ -265,7 +267,7 @@
 
 <dialog id="caseDlg" class="dlg">
   <div class="dlg-head"><h2>📁 Mijn zaken</h2><button class="close" id="btnCaseClose" type="button" aria-label="Sluiten">×</button></div>
-  <p class="small muted">Elk onderzoek wordt automatisch bewaard in de huidige zaak, alleen op dit apparaat. Zet meerdere onderzoeken samen in één web om verbanden te zien, zoals dezelfde oplichter bij verschillende slachtoffers.</p>
+  <p class="small muted">Elk onderzoek wordt automatisch bewaard in de huidige zaak, op dit apparaat (of op de teamserver bij een ☁ teamzaak). Zet meerdere onderzoeken samen in één web om verbanden te zien, zoals dezelfde oplichter bij verschillende slachtoffers.</p>
   <div class="case-grid">
     <div><div id="caseList" class="case-list"></div><button type="button" id="caseNew" class="ghost wide">+ Nieuwe zaak</button>
       <label class="ghost wide filebtn center">Back-up terugzetten<input type="file" id="caseImportFile" accept=".json,application/json" hidden></label></div>
@@ -279,6 +281,7 @@
         <button type="button" id="caseExport" class="ghost">Back-up maken (bestand)</button>
         <button type="button" id="caseDelete" class="ghost">Zaak verwijderen</button>
       </div>
+      <div id="caseTeam" class="case-team" hidden></div>
     </div>
   </div>
 </dialog>
@@ -301,6 +304,35 @@
   <div class="lbtns"><button type="button" id="setTest" class="ghost">Testen</button><button type="button" id="setSave" class="primary">Opslaan</button></div>
 </dialog>
 
+<dialog id="teamDlg" class="dlg dlg-small">
+  <div class="dlg-head"><h2>☁ Samenwerken</h2><button class="close" id="teamClose" type="button" aria-label="Sluiten">×</button></div>
+  <p class="small muted">Met een ChainTrace-teamserver (eigen server in een Docker-container) deel je zaken met collega's: samen aan één zaak werken, opmerkingen, gedeelde labels en een link om een zaak te laten bekijken. Zonder teamserver werkt de app gewoon zelfstandig.</p>
+  <div id="teamLoginBox">
+    <label class="field" id="teamUrlBox"><span>Adres van de teamserver</span><input id="teamUrl" type="url" inputmode="url" spellcheck="false" autocomplete="url" placeholder="https://chaintrace.mijnteam.nl"></label>
+    <label class="field"><span>Gebruikersnaam</span><input id="teamUser" type="text" autocomplete="username" spellcheck="false" autocapitalize="off"></label>
+    <label class="field"><span>Wachtwoord</span><input id="teamPass" type="password" autocomplete="current-password"></label>
+    <div id="teamSetupBox" hidden>
+      <p class="small"><b>Nieuwe server.</b> Maak het eerste beheerdersaccount aan met de setup-code uit de serverlog (<code>docker compose logs</code>).</p>
+      <label class="field"><span>Setup-code</span><input id="teamCode" type="text" spellcheck="false" autocapitalize="characters"></label>
+      <button type="button" id="teamSetup" class="primary wide">Beheerder aanmaken</button>
+    </div>
+    <button type="button" id="teamLogin" class="primary wide">Inloggen</button>
+  </div>
+  <div id="teamInBox" hidden>
+    <p>Ingelogd als <b id="teamWho"></b></p>
+    <p class="small muted">Open <b>Mijn zaken</b> om een zaak te delen of mee te werken. Teamzaken hebben een ☁ en worden automatisch bijgewerkt.</p>
+    <div class="lbtns"><button type="button" id="teamSyncNow" class="ghost">Nu bijwerken</button><button type="button" id="teamPwChange" class="ghost">Wachtwoord wijzigen</button><button type="button" id="teamLogout" class="ghost">Uitloggen</button></div>
+    <div id="teamAdminBox" hidden>
+      <h3>Collega toevoegen (beheerder)</h3>
+      <label class="field"><span>Gebruikersnaam</span><input id="teamNewUser" type="text" autocomplete="off" spellcheck="false" autocapitalize="off"></label>
+      <label class="field"><span>Wachtwoord (minstens 8 tekens)</span><input id="teamNewPass" type="text" autocomplete="new-password" spellcheck="false"></label>
+      <label class="checkline"><input type="checkbox" id="teamNewAdmin"> Ook beheerder</label>
+      <button type="button" id="teamAddUser" class="ghost wide">Account aanmaken</button>
+    </div>
+  </div>
+  <p id="teamMsg" class="small"></p>
+</dialog>
+
 <dialog id="watchDlg" class="dlg">
   <div class="dlg-head"><h2>🔔 Gevolgde adressen</h2><button class="close" id="btnWatchClose" type="button" aria-label="Sluiten">×</button></div>
   <p class="small muted">De app controleert gevolgde adressen regelmatig (op Android ook als de app dicht is) en geeft een melding als er weer geld beweegt. Dan is het tijd om de exchange of politie te waarschuwen.</p>
@@ -315,13 +347,13 @@
   Data: mempool.space · Blockscout · TronGrid · OFAC-lijst (0xB10C) · ScamSniffer. Heuristieken zijn aanwijzingen, geen bewijs.
 </footer>
 
-<script src="i18n.js?v=2.3"></script>
+<script src="i18n.js?v=3.0"></script>
 <script src="vendor/cytoscape.min.js"></script>
 <script src="vendor/jspdf.umd.min.js"></script>
 <script src="vendor/jspdf.plugin.autotable.min.js"></script>
 <script src="vendor/jsQR.js"></script>
-<script src="patterns.js?v=2.3"></script>
-<script src="labels.js?v=2.3"></script>
-<script src="app.js?v=2.3"></script>
+<script src="patterns.js?v=3.0"></script>
+<script src="labels.js?v=3.0"></script>
+<script src="app.js?v=3.0"></script>
 </body>
 </html>
