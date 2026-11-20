@@ -533,6 +533,7 @@ async function fetchSol(addr, before) {
     txs = await Promise.all(sigs.map(x => getData(B, false, 4, solRpc('getTransaction', [x.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]))
       .then(r => r?.result || null).catch(() => null)));
   }
+  if (sigs.length && txs.every(t => !t)) throw new Error('de Solana-server gaf geen transacties terug');
   const transfers = [];
   sigs.forEach((s, i) => { for (const t of solTransfers(txs[i], s.signature)) if (t.from === addr || t.to === addr) transfers.push(t); });
   const all = sigRes?.result || [];
@@ -876,7 +877,9 @@ async function runTrace(addr, chain, role, pattern, opts) {
   renderPlaybook();
   renderSummary();
   if (!stopped) recordObservations();
-  setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen. Tik op een adres voor details.`);
+  const seedErr = !stopped && nodes.get(current?.seedKey)?.flags.find(f => f.code === 'error');
+  if (seedErr && edges.size === 0) setStatus(`${seedErr.text}. Controleer de internetverbinding (of de Solana-server/TronGrid-sleutel onder Instellingen) en probeer het opnieuw.`, true);
+  else setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen. Tik op een adres voor details.`);
 }
 
 // ---------- herkomst: startwallets en instroom via exchanges ----------
