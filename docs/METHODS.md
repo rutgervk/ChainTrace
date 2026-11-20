@@ -12,6 +12,7 @@ Dit document beschrijft precies hoe ChainTrace tot zijn uitkomsten komt, zodat i
 - Bitcoin/Litecoin: bij een uitgaande transactie telt elke output (behalve terug naar een eigen input-adres) als overboeking; bij een inkomende transactie wordt het ontvangen bedrag gelijk verdeeld over de afzenders.
 - Ethereum/Optimism/Avalanche: gewone overboekingen, ERC-20-tokens én **interne overboekingen** (ETH via een contract).
 - Tron: TRC-20-tokens (USDT/USDC) én gewone TRX-overboekingen.
+- Solana: SOL-, USDC- en USDT-overboekingen. De Android-app haalt de geschiedenis via de officiële Solana-server (volledige geschiedenis; recente transacties via PublicNode voor snelheid). De webversie gebruikt PublicNode, die maar ±1,5 dag geschiedenis kent, tenzij je onder Instellingen een eigen server invult. De app bladert door tot er genoeg overboekingen zijn (startadres tot 100 transacties). Is het ingevoerde adres een token-rekening, dan onderzoekt de app de wallet van de eigenaar.
 
 ## 2. Het geld volgen (`expand`)
 

@@ -491,7 +491,7 @@ Object.assign(exact, TEAM_ACT, {
   'Alleen de eigenaar beheert leden': 'Only the owner manages members', 'Alleen de eigenaar maakt deellinks': 'Only the owner creates share links',
   'Alleen de eigenaar kan de zaak verwijderen': 'Only the owner can delete the case', 'Deellink ongeldig of ingetrokken': 'Share link invalid or revoked',
   'Huidig wachtwoord klopt niet': 'Current password is incorrect', 'Nieuw wachtwoord minstens 8 tekens': 'New password at least 8 characters',
-  'De eigenaar heeft al volledige toegang': 'The owner already has full access', 'Onderzoek niet gevonden': 'Investigation not found', 'Lege opmerking': 'Empty comment', 'de Solana-server gaf geen transacties terug': 'the Solana server returned no transactions', 'Intussen door iemand anders bijgewerkt': 'Updated by someone else in the meantime', 'een teamgenoot': 'a team member'
+  'De eigenaar heeft al volledige toegang': 'The owner already has full access', 'Onderzoek niet gevonden': 'Investigation not found', 'Lege opmerking': 'Empty comment', 'Solana-adres controleren…': 'Checking Solana address…', 'Geen transacties gevonden. De gratis openbare Solana-server kent alleen de laatste ±1,5 dag. Gebruik de Android-app (volledige geschiedenis) of vul onder Instellingen een eigen Solana-server in (bijv. gratis bij Helius).': 'No transactions found. The free public Solana server only knows the last ±1.5 days. Use the Android app (full history) or enter your own Solana server under Settings (e.g. free at Helius).', 'de Solana-server gaf geen transacties terug': 'the Solana server returned no transactions', 'Intussen door iemand anders bijgewerkt': 'Updated by someone else in the meantime', 'een teamgenoot': 'a team member'
 });
 patterns.unshift(['bewaard {0} door {1}', 'saved {0} by {1}']);
 patterns.push(
@@ -508,6 +508,9 @@ patterns.push(
   ['Bekijk zaak "{0}" in ChainTrace (alleen kijken): {1}', 'View case "{0}" in ChainTrace (view only): {1}'], ['Werk mee aan zaak "{0}" in ChainTrace: {1}', 'Collaborate on case "{0}" in ChainTrace: {1}'],
   ['Fout van de teamserver ({#0})', 'Team server error ({0})'],
   ['Ophalen mislukt: {0}. Controleer de internetverbinding (of de Solana-server/TronGrid-sleutel onder Instellingen) en probeer het opnieuw.', 'Fetching failed: {0}. Check the internet connection (or the Solana server/TronGrid key under Settings) and try again.'],
+  ['Ingevoerd adres is een {0}-rekening; onderzocht is de wallet van de eigenaar ({1}). {2}', 'The address entered is a {0} token account; the owner's wallet ({1}) was investigated. {2}'],
+  ['{#0} recente transacties bekeken, maar geen overboekingen van SOL, USDC of USDT gevonden (bijvoorbeeld alleen swaps, NFT's of spam). Open het adres in de verkenner en tik op "Oudere transacties laden".', '{0} recent transactions checked, but no transfers of SOL, USDC or USDT found (for example only swaps, NFTs or spam). Open the address in the explorer and tap "Load older transactions".'],
+  ['{0}Geen transacties gevonden. De gratis openbare Solana-server kent alleen de laatste ±1,5 dag. Gebruik de Android-app (volledige geschiedenis) of vul onder Instellingen een eigen Solana-server in (bijv. gratis bij Helius).', '{0}No transactions found. The free public Solana server only knows the last ±1.5 days. Use the Android app (full history) or enter your own Solana server under Settings (e.g. free at Helius).'],
   ['Samengevoegd met de wijzigingen van {0}.', 'Merged with the changes made by {0}.'],
   ...Object.entries(TEAM_ACT).map(([nl, en]) => [nl + ': {0}', en + ': {0}'])
 );

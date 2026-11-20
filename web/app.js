@@ -93,7 +93,7 @@ function acquire() { return new Promise(r => { if (running < MAX_PAR) { running+
 function release() { const next = waiting.shift(); if (next) next(); else running--; }
 
 // Minimale tijd tussen verzoeken per host; TronGrid zonder API-sleutel is streng.
-const HOST_GAP = { 'api.trongrid.io': 1050, 'api.routescan.io': 550, 'solana-rpc.publicnode.com': 250 }; // gemeten: ~1 verzoek/s wordt geaccepteerd
+const HOST_GAP = { 'api.trongrid.io': 1050, 'api.routescan.io': 550, 'solana-rpc.publicnode.com': 250, 'api.mainnet-beta.solana.com': 270 }; // gemeten: ~1 verzoek/s wordt geaccepteerd
 const hostNext = {};
 async function throttle(host) {
   const gap = HOST_GAP[host];
@@ -104,6 +104,23 @@ async function throttle(host) {
   if (at > now) await sleep(at - now);
 }
 
+// Android: Solana-verzoeken via de app zelf naar de officiële Solana-server. Die heeft de volledige geschiedenis,
+// maar weigert verzoeken uit een browser. De gratis openbare server (publicnode) kent maar ±1,5 dag geschiedenis.
+const SOL_OFFICIAL = 'https://api.mainnet-beta.solana.com';
+let nativeSol = !!window.AndroidBridge?.solRpc;
+const solCbs = new Map();
+let solCbN = 0;
+window.ChainTraceSolCb = (id, code, text) => { const f = solCbs.get(id); if (f) { solCbs.delete(id); f({ code, text }); } };
+function nativeSolPost(body) {
+  return new Promise((res, rej) => {
+    const id = 's' + (++solCbN);
+    const t = setTimeout(() => { solCbs.delete(id); rej(new Error('Geen antwoord van de Solana-server')); }, 35000);
+    solCbs.set(id, r => { clearTimeout(t); res(r); });
+    window.AndroidBridge.solRpc(id, JSON.stringify(body));
+  });
+}
+const solViaApp = () => nativeSol && API.sol === SOL_DEFAULT;
+
 function getData(url, asText = false, tries = 6, body = null) {
   const ck = body ? url + '|' + JSON.stringify(body) : url;
   if (cache.has(ck)) return cache.get(ck);
@@ -112,6 +129,15 @@ function getData(url, asText = false, tries = 6, body = null) {
     await acquire();
     try {
       for (let attempt = 0; attempt < tries; attempt++) {
+        if (body && url === SOL_DEFAULT && solViaApp()) {
+          await throttle('api.mainnet-beta.solana.com');
+          try {
+            const n = await nativeSolPost(body);
+            if (n.code === 429 || n.code >= 500) { await sleep(Math.min(1500 * 2 ** attempt, 15000)); continue; }
+            if (n.code === 200) { const j = JSON.parse(n.text); if (j.error?.code !== 403) return j; }
+            if (n.code === 403 || n.code === 0) nativeSol = false; // geblokkeerd/geen verbinding: openbare server gebruiken
+          } catch { /* openbare server gebruiken */ }
+        }
         await throttle(host);
         // Eigen time-out: sommige API's laten een verzoek eindeloos hangen.
         const ctl = new AbortController(), outer = abortCtl.signal;
@@ -326,7 +352,7 @@ async function fetchAddr(chain, addr, opts = {}) {
   if (demoMode || isDemoAddr(addr)) return demoData(addr);
   const d = isUtxo(chain) ? await fetchBtc(addr, chain, opts.pages || 2) : isBlockscout(chain) ? await fetchEvm(chain, addr)
     : chain === 'avax' ? await fetchRoutescan(chain, addr) : chain === 'zksync' ? await fetchZksync(addr)
-    : chain === 'sol' ? await fetchSol(addr) : await fetchTron(addr);
+    : chain === 'sol' ? await fetchSol(addr, null, { pages: opts.pages >= 4 ? 5 : 2, want: opts.pages >= 4 ? 10 : 4 }) : await fetchTron(addr);
   // Absurde bedragen (bv. 2^256-"transfers" van nep-tokens) als spam behandelen.
   return despam(d);
 }
@@ -518,7 +544,7 @@ function solTransfers(tx, sig) {
   }
   return out.filter(t => t.from && t.to && t.from !== t.to);
 }
-async function fetchSol(addr, before) {
+async function fetchSolPage(addr, before) {
   const B = API.sol;
   const opts = { limit: solLimit() };
   if (before) opts.before = before;
@@ -530,8 +556,12 @@ async function fetchSol(addr, before) {
   let txs = [];
   if (sigs.length) {
     // De gratis RPC staat geen batches met getTransaction toe: één voor één (getempo via HOST_GAP).
-    txs = await Promise.all(sigs.map(x => getData(B, false, 4, solRpc('getTransaction', [x.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]))
-      .then(r => r?.result || null).catch(() => null)));
+    // Via de app: recente transacties bij de snelle openbare server, oudere bij de officiële server (beide tegelijk).
+    const recent = Date.now() / 1000 - 28 * 3600;
+    const urlFor = x => solViaApp() && x.blockTime > recent ? SOL_DEFAULT + '/' : B;
+    txs = await Promise.all(sigs.map(x => getData(urlFor(x), false, 4, solRpc('getTransaction', [x.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]))
+      .then(r => r?.result || (urlFor(x) !== B ? getData(B, false, 4, solRpc('getTransaction', [x.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }])).then(r2 => r2?.result || null) : null))
+      .catch(() => null)));
   }
   if (sigs.length && txs.every(t => !t)) throw new Error('de Solana-server gaf geen transacties terug');
   const transfers = [];
@@ -539,9 +569,35 @@ async function fetchSol(addr, before) {
   const all = sigRes?.result || [];
   return {
     transfers, meta: {}, txCount: null,
-    cursor: all.length >= solLimit() ? { before: all[all.length - 1].signature } : null,
-    balance: balRes?.result?.value != null ? `${fmt(balRes.result.value / 1e9)} SOL` : null
+    cursor: all.length >= Math.min(10, solLimit()) ? { before: all[all.length - 1].signature } : null,
+    balance: balRes?.result?.value != null ? `${fmt(balRes.result.value / 1e9)} SOL` : null,
+    scanned: all.length
   };
+}
+// Solana: doorzoeken (meerdere pagina's) tot er genoeg echte overboekingen zijn.
+// Veel adressen hebben vooral swaps, NFT-acties of spam; in de recentste 20 zit dan soms geen enkele overboeking.
+async function fetchSol(addr, before, { pages = 1, want = 8 } = {}) {
+  const out = await fetchSolPage(addr, before);
+  let p = 1;
+  const real = () => out.transfers.filter(t => !t.dust).length;
+  while (out.cursor && p < pages && real() < want && !abortCtl.signal.aborted) {
+    const more = await fetchSolPage(addr, out.cursor.before).catch(() => null);
+    if (!more) break;
+    out.transfers.push(...more.transfers);
+    out.scanned += more.scanned;
+    out.cursor = more.cursor;
+    p++;
+  }
+  return out;
+}
+// Is dit een token-rekening (bijv. USDT-rekening) in plaats van een wallet? Dan de eigenaar teruggeven.
+async function solOwnerOf(addr) {
+  try {
+    const r = await getData(API.sol, false, 2, solRpc('getAccountInfo', [addr, { encoding: 'jsonParsed' }]));
+    const d = r?.result?.value?.data;
+    if (d?.program === 'spl-token' && d.parsed?.type === 'account' && d.parsed.info?.owner) return { owner: d.parsed.info.owner, mint: d.parsed.info.mint };
+  } catch { /* gewoon het adres zelf gebruiken */ }
+  return null;
 }
 
 // Welke EVM-keten? Een 0x-adres kan op meerdere ketens bestaan: tel snel de activiteit per keten.
@@ -848,6 +904,12 @@ async function runTrace(addr, chain, role, pattern, opts) {
   resetGraph();
   demoMode = norm(chain, addr) === DEMO.victim || norm(chain, addr) === DEMO.scammer;
   $('#formBox').open = false;
+  let tokenNote = '';
+  if (chain === 'sol') {
+    setStatus('Solana-adres controleren…');
+    const o = await solOwnerOf(addr);
+    if (o) { tokenNote = `Ingevoerd adres is een ${SOL_MINTS[o.mint] || 'token'}-rekening; onderzocht is de wallet van de eigenaar (${short(o.owner)}). `; addr = o.owner; }
+  }
   current = { chain, role, pattern, opts, seedKey: keyOf(chain, addr), started: new Date().toISOString() };
   dbCache.clear();
   loadNotes();
@@ -879,7 +941,9 @@ async function runTrace(addr, chain, role, pattern, opts) {
   if (!stopped) recordObservations();
   const seedErr = !stopped && nodes.get(current?.seedKey)?.flags.find(f => f.code === 'error');
   if (seedErr && edges.size === 0) setStatus(`${seedErr.text}. Controleer de internetverbinding (of de Solana-server/TronGrid-sleutel onder Instellingen) en probeer het opnieuw.`, true);
-  else setStatus(stopped ? 'Gestopt.' : `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen. Tik op een adres voor details.`);
+  else if (!stopped && edges.size === 0 && chain === 'sol' && seed.data && !seed.data.scanned && !solViaApp() && API.sol === SOL_DEFAULT) setStatus(tokenNote + 'Geen transacties gevonden. De gratis openbare Solana-server kent alleen de laatste ±1,5 dag. Gebruik de Android-app (volledige geschiedenis) of vul onder Instellingen een eigen Solana-server in (bijv. gratis bij Helius).', true);
+  else if (!stopped && edges.size === 0 && chain === 'sol' && seed.data) setStatus(tokenNote + `${seed.data.scanned || 0} recente transacties bekeken, maar geen overboekingen van SOL, USDC of USDT gevonden (bijvoorbeeld alleen swaps, NFT's of spam). Open het adres in de verkenner en tik op "Oudere transacties laden".`);
+  else setStatus(stopped ? 'Gestopt.' : tokenNote + `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen. Tik op een adres voor details.`);
 }
 
 // ---------- herkomst: startwallets en instroom via exchanges ----------
@@ -3798,7 +3862,7 @@ function setupFeatures() {
 }
 
 // ---------- instellingen: eigen sleutels (optioneel) en taal ----------
-const SOL_DEFAULT = 'https://solana-rpc.publicnode.com';
+var SOL_DEFAULT = 'https://solana-rpc.publicnode.com';
 const settings = {
   get: () => store.get('chaintrace.settings', {}),
   set: s => { store.set('chaintrace.settings', s); applySettings(); }
@@ -4113,7 +4177,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '3.0.1';
+const APP_VERSION = '3.0.2';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -4227,7 +4291,7 @@ function setGraphView(v) {
 }
 
 // ---------- verantwoording: herkomst van gegevens en controleerbare vingerafdruk ----------
-const SOURCE_NAME = { btc: 'mempool.space', ltc: 'litecoinspace.org', eth: 'eth.blockscout.com', op: 'explorer.optimism.io', tron: 'api.trongrid.io', avax: 'api.routescan.io', zksync: 'block-explorer-api.mainnet.zksync.io', sol: () => new URL(API.sol).host };
+const SOURCE_NAME = { btc: 'mempool.space', ltc: 'litecoinspace.org', eth: 'eth.blockscout.com', op: 'explorer.optimism.io', tron: 'api.trongrid.io', avax: 'api.routescan.io', zksync: 'block-explorer-api.mainnet.zksync.io', sol: () => solViaApp() ? 'api.mainnet-beta.solana.com' : new URL(API.sol).host };
 const sourceOf = chain => { const s = SOURCE_NAME[chain]; return typeof s === 'function' ? s() : s; };
 async function sha256Hex(text) {
   const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));

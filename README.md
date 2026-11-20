@@ -84,7 +84,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | Avalanche | Routescan |
 | zkSync Era | zkSync block explorer API |
 | Tron | TronGrid |
-| Solana | PublicNode RPC (of eigen server) |
+| Solana | Android: officiële Solana-server (volledige geschiedenis) + PublicNode · Web: PublicNode (alleen ±1,5 dag) of eigen server |
 | Bridges | deBridge, Across, LayerZero scan |
 | Koersen in euro | Binance (dagkoersen) |
 

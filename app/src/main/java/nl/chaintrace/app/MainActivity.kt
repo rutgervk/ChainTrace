@@ -36,6 +36,7 @@ import java.io.File
 class MainActivity : ComponentActivity() {
 
     private lateinit var webView: WebView
+    private val solExec = java.util.concurrent.Executors.newFixedThreadPool(3)
     private var fileCallback: ValueCallback<Array<Uri>>? = null
 
     private var tts: TextToSpeech? = null
@@ -170,6 +171,32 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun stopSpeaking() = runOnUiThread { tts?.stop() }
+
+        // Solana-RPC via de app (zonder browser-Origin): de officiële server heeft de volledige geschiedenis.
+        @JavascriptInterface
+        fun solRpc(id: String, body: String) {
+            solExec.execute {
+                var code = 0
+                var text = ""
+                try {
+                    val c = java.net.URL("https://api.mainnet-beta.solana.com").openConnection() as java.net.HttpURLConnection
+                    c.requestMethod = "POST"
+                    c.doOutput = true
+                    c.connectTimeout = 15000
+                    c.readTimeout = 30000
+                    c.setRequestProperty("Content-Type", "application/json")
+                    c.outputStream.use { it.write(body.toByteArray()) }
+                    code = c.responseCode
+                    text = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+                    c.disconnect()
+                } catch (e: Exception) {
+                    code = 0
+                    text = e.message ?: "fout"
+                }
+                val js = "window.ChainTraceSolCb && window.ChainTraceSolCb(${org.json.JSONObject.quote(id)}, $code, ${org.json.JSONObject.quote(text)})"
+                runOnUiThread { webView.evaluateJavascript(js, null) }
+            }
+        }
 
         @JavascriptInterface
         fun keepAwake(on: Boolean) = runOnUiThread {
