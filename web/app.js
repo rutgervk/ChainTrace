@@ -529,7 +529,7 @@ function solTransfers(tx, sig) {
     if (!info) continue;
     if (i.program === 'system' && (p.type === 'transfer' || p.type === 'transferWithSeed') && info.lamports > 0) {
       out.push({ from: info.source, to: info.destination, value: info.lamports / 1e9, asset: 'SOL', time, txid: sig });
-    } else if (i.program === 'spl-token' && (p.type === 'transfer' || p.type === 'transferChecked')) {
+    } else if ((i.program === 'spl-token' || i.program === 'spl-token-2022') && (p.type === 'transfer' || p.type === 'transferChecked')) {
       const src = tok[info.source], dst = tok[info.destination];
       const mint = info.mint || src?.mint || dst?.mint;
       const dec = info.tokenAmount?.decimals ?? src?.dec ?? dst?.dec ?? 0;
@@ -841,6 +841,8 @@ async function expand(n, depth, dir) {
 
   const { opts, pattern } = current;
   const pat = window.PATTERNS[pattern];
+  // Startadres: altijd beide kanten tonen (wie stuurde geld, wie ontving het); verder volgen gebeurt alleen uitgaand.
+  if (depth === 0) dir = 'both';
   const agg = new Map();
   for (const t of n.data.transfers) {
     let d, cp;
@@ -4177,7 +4179,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '3.0.2';
+const APP_VERSION = '3.0.3';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
