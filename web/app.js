@@ -108,6 +108,7 @@ async function throttle(host) {
 // maar weigert verzoeken uit een browser. De gratis openbare server (publicnode) kent maar ±1,5 dag geschiedenis.
 const SOL_OFFICIAL = 'https://api.mainnet-beta.solana.com';
 let nativeSol = !!window.AndroidBridge?.solRpc;
+let nativeSolErr = ''; // laatste reden waarom de officiële server niet lukte
 const solCbs = new Map();
 let solCbN = 0;
 window.ChainTraceSolCb = (id, code, text) => { const f = solCbs.get(id); if (f) { solCbs.delete(id); f({ code, text }); } };
@@ -133,10 +134,18 @@ function getData(url, asText = false, tries = 6, body = null) {
           await throttle('api.mainnet-beta.solana.com');
           try {
             const n = await nativeSolPost(body);
-            if (n.code === 429 || n.code >= 500) { await sleep(Math.min(1500 * 2 ** attempt, 15000)); continue; }
-            if (n.code === 200) { const j = JSON.parse(n.text); if (j.error?.code !== 403) return j; }
-            if (n.code === 403 || n.code === 0) nativeSol = false; // geblokkeerd/geen verbinding: openbare server gebruiken
-          } catch { /* openbare server gebruiken */ }
+            if (n.code === 200) {
+              const j = JSON.parse(n.text);
+              if (j.error?.code === 429) { await sleep(Math.min(1500 * 2 ** attempt, 15000)); continue; }
+              if (j.error?.code !== 403) return j;
+            }
+            // Haperend (mobiel) netwerk of druk: opnieuw proberen in plaats van op te geven.
+            if (n.code === 0 || n.code === 429 || n.code >= 500) {
+              nativeSolErr = n.code === 0 ? 'geen verbinding (' + String(n.text).slice(0, 60) + ')' : 'HTTP ' + n.code;
+              if (attempt < tries - 1) { await sleep(Math.min(1500 * 2 ** attempt, 15000)); continue; }
+            }
+            if (n.code === 403 || (n.code === 200 && n.text.includes('"code":403'))) { nativeSol = false; nativeSolErr = 'de officiële Solana-server weigert dit netwerk (403)'; }
+          } catch (e) { nativeSolErr = e.message; }
         }
         await throttle(host);
         // Eigen time-out: sommige API's laten een verzoek eindeloos hangen.
@@ -908,6 +917,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   $('#formBox').open = false;
   let tokenNote = '';
   if (chain === 'sol') {
+    nativeSol = !!window.AndroidBridge?.solRpc; nativeSolErr = '';
     setStatus('Solana-adres controleren…');
     const o = await solOwnerOf(addr);
     if (o) { tokenNote = `Ingevoerd adres is een ${SOL_MINTS[o.mint] || 'token'}-rekening; onderzocht is de wallet van de eigenaar (${short(o.owner)}). `; addr = o.owner; }
@@ -943,6 +953,7 @@ async function runTrace(addr, chain, role, pattern, opts) {
   if (!stopped) recordObservations();
   const seedErr = !stopped && nodes.get(current?.seedKey)?.flags.find(f => f.code === 'error');
   if (seedErr && edges.size === 0) setStatus(`${seedErr.text}. Controleer de internetverbinding (of de Solana-server/TronGrid-sleutel onder Instellingen) en probeer het opnieuw.`, true);
+  else if (!stopped && edges.size === 0 && chain === 'sol' && nativeSolErr && window.AndroidBridge?.solRpc) setStatus(tokenNote + `De officiële Solana-server (volledige geschiedenis) was niet bereikbaar: ${nativeSolErr}. Probeer het opnieuw, bij voorkeur via wifi.`, true);
   else if (!stopped && edges.size === 0 && chain === 'sol' && seed.data && !seed.data.scanned && !solViaApp() && API.sol === SOL_DEFAULT) setStatus(tokenNote + 'Geen transacties gevonden. De gratis openbare Solana-server kent alleen de laatste ±1,5 dag. Gebruik de Android-app (volledige geschiedenis) of vul onder Instellingen een eigen Solana-server in (bijv. gratis bij Helius).', true);
   else if (!stopped && edges.size === 0 && chain === 'sol' && seed.data) setStatus(tokenNote + `${seed.data.scanned || 0} recente transacties bekeken, maar geen overboekingen van SOL, USDC of USDT gevonden (bijvoorbeeld alleen swaps, NFT's of spam). Open het adres in de verkenner en tik op "Oudere transacties laden".`);
   else setStatus(stopped ? 'Gestopt.' : tokenNote + `Klaar: ${nodes.size} adressen, ${edges.size} geldstromen. Tik op een adres voor details.`);
@@ -3907,6 +3918,12 @@ async function testSettings() {
     const r = await fetch(sol, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(solRpc('getSlot', [])) }).then(x => x.json());
     out.push(r.result ? '✓ Solana werkt' : '✗ Solana: ' + (r.error?.message || 'geen antwoord'));
   } catch (e) { out.push('✗ Solana: ' + e.message); }
+  if (window.AndroidBridge?.solRpc && !$('#setSol').value.trim()) {
+    try {
+      const n = await nativeSolPost(solRpc('getSignaturesForAddress', ['9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM', { limit: 1 }]));
+      out.push(n.code === 200 && n.text.includes('signature') ? '✓ Solana volledige geschiedenis werkt' : `✗ Solana volledige geschiedenis: HTTP ${n.code} ${String(n.text).slice(0, 80)}`);
+    } catch (e) { out.push('✗ Solana volledige geschiedenis: ' + e.message); }
+  }
   const key = $('#setTron').value.trim();
   if (key) {
     try {
@@ -4179,7 +4196,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '3.0.3';
+const APP_VERSION = '3.0.4';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
