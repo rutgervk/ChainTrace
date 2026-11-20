@@ -11,8 +11,8 @@ android {
         applicationId = "nl.chaintrace.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 14
-        versionName = "3.0"
+        versionCode = 15
+        versionName = "3.0.1"
     }
 
     buildTypes {

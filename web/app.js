@@ -2310,7 +2310,11 @@ function resetGraph() {
 }
 
 function setStatus(t, err = false) { const s = $('#status'); s.textContent = t; s.classList.toggle('err', err); }
-function setBusy(b) { $('#btnTrace').disabled = b; $('#btnStop').hidden = !b; if (!b) setProgress(null); }
+function setBusy(b) {
+  $('#btnTrace').disabled = b; $('#btnStop').hidden = !b; if (!b) setProgress(null);
+  // Android: scherm aan houden tijdens het ophalen, anders breekt het systeem de verbindingen af.
+  try { window.AndroidBridge?.keepAwake?.(!!b); } catch { /* oudere app */ }
+}
 // Voortgangsbalk: stap i van n (met een kleine tussenstand op basis van geladen adressen).
 let progressStep = null;
 function setProgress(i, n, label) {
@@ -4109,7 +4113,7 @@ function setupV19() {
 }
 
 // ---------- v2.0: ontbrekende gegevens, stortingsadressen, tijdlijn, verantwoording ----------
-const APP_VERSION = '3.0';
+const APP_VERSION = '3.0.1';
 
 // Tron-adressen komen bij native TRX als hex (41…): omzetten naar het gewone T…-adres (base58check).
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
